@@ -182,6 +182,8 @@ LoadVizgen <- function(data.dir, fov, assay = 'Vizgen', z = 3L) {
 #' @param molecule.coordinates Whether or not to load molecule pixel coordinates
 #' @param segmentations One of "cell", "nucleus" or NULL (to load either cell
 #' segmentations, nucleus segmentations or neither)
+#' @param flip.xy Whether or not to flip the x/y coordinates of the Xenium outputs
+#' to match what is displayed in Xenium Explorer, or fit on your screen better.
 #'
 #' @importFrom SeuratObject Cells CreateCentroids CreateFOV
 #' CreateSegmentation CreateSeuratObject CreateMolecules
