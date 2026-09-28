@@ -2901,6 +2901,762 @@ ReadXenium <- function(
   return(data)
 }
 
+#' Check that the packages required to read Atera outputs are installed
+#'
+#' @keywords internal
+#' @noRd
+.AteraCheckDeps <- function() {
+  pkgs <- c('blosc', 'jsonlite', 'data.table')
+  have <- vapply(X = pkgs, FUN = requireNamespace, FUN.VALUE = logical(1), quietly = TRUE)
+  if (!all(have)) {
+    stop(
+      "Reading Atera outputs requires the following package(s): ",
+      paste(pkgs[!have], collapse = ', '),
+      call. = FALSE
+    )
+  }
+}
+
+#' @keywords internal
+#' @noRd
+.AteraLeU16 <- function(raw, pos) {
+  as.integer(raw[pos]) + as.integer(raw[pos + 1L]) * 256L
+}
+
+#' Widen a little-endian 4-byte field to a double, avoiding 32-bit signed
+#' integer overflow (zip offsets/sizes routinely exceed 2^31)
+#'
+#' @keywords internal
+#' @noRd
+.AteraLeU32 <- function(raw, pos) {
+  b <- as.integer(raw[pos:(pos + 3L)])
+  b[1] + b[2] * 256 + b[3] * 65536 + b[4] * 16777216
+}
+
+#' @keywords internal
+#' @noRd
+.AteraLeU64 <- function(raw, pos) {
+  b <- as.integer(raw[pos:(pos + 7L)])
+  lo <- b[1] + b[2] * 256 + b[3] * 65536 + b[4] * 16777216
+  hi <- b[5] + b[6] * 256 + b[7] * 65536 + b[8] * 16777216
+  lo + hi * 4294967296
+}
+
+#' Locate the End Of Central Directory record of a zip file, following the
+#' Zip64 EOCD locator/record when the classic EOCD's entry count/size/offset
+#' fields are the \code{0xFFFF}/\code{0xFFFFFFFF} placeholder
+#'
+#' @keywords internal
+#' @noRd
+.AteraZipEOCD <- function(con, file.size) {
+  eocd.sig <- as.raw(c(0x50, 0x4b, 0x05, 0x06))
+  tail.size <- min(file.size, 22L + 65535L)
+  seek(con, where = file.size - tail.size, origin = "start")
+  tail.bytes <- readBin(con, what = "raw", n = tail.size)
+  n <- length(tail.bytes)
+  pos <- NA_integer_
+  for (i in (n - 21L):1L) {
+    if (i < 1L) break
+    if (tail.bytes[i] == eocd.sig[1] && tail.bytes[i + 1L] == eocd.sig[2] &&
+        tail.bytes[i + 2L] == eocd.sig[3] && tail.bytes[i + 3L] == eocd.sig[4]) {
+      pos <- i
+      break
+    }
+  }
+  if (is.na(pos)) {
+    stop("Could not locate End Of Central Directory record; not a valid zip file", call. = FALSE)
+  }
+  n.entries <- .AteraLeU16(tail.bytes, pos + 10L)
+  cd.size <- .AteraLeU32(tail.bytes, pos + 12L)
+  cd.offset <- .AteraLeU32(tail.bytes, pos + 16L)
+
+  is.zip64 <- n.entries == 0xFFFF || cd.size >= 0xFFFFFFFF || cd.offset >= 0xFFFFFFFF
+  if (is.zip64) {
+    # the Zip64 EOCD locator is the fixed-size (20 byte) record immediately
+    # preceding the EOCD record we just found
+    locator.abs.pos <- (file.size - tail.size) + pos - 20L
+    seek(con, where = locator.abs.pos, origin = "start")
+    locator <- readBin(con, what = "raw", n = 20L)
+    zip64.eocd.offset <- .AteraLeU64(locator, 9L)
+    seek(con, where = zip64.eocd.offset, origin = "start")
+    zip64.eocd <- readBin(con, what = "raw", n = 56L)
+    n.entries <- .AteraLeU64(zip64.eocd, 33L)
+    cd.size <- .AteraLeU64(zip64.eocd, 41L)
+    cd.offset <- .AteraLeU64(zip64.eocd, 49L)
+  }
+  list(n.entries = n.entries, cd.size = cd.size, cd.offset = cd.offset)
+}
+
+#' Parse the central directory of a zip file into a name -> (local header
+#' offset, size) index, entirely in memory (no disk extraction). Atera
+#' zarr.zip archives always store entries uncompressed (zip method
+#' \dQuote{Stored}); the zarr/Blosc layer does all the compression, so this
+#' index is all that's needed to seek directly to any chunk's raw bytes.
+#'
+#' @keywords internal
+#' @noRd
+.AteraZipIndex <- function(zip.file) {
+  file.size <- file.info(zip.file)$size
+  con <- file(zip.file, "rb")
+  on.exit(close(con))
+  eocd <- .AteraZipEOCD(con, file.size)
+
+  seek(con, where = eocd$cd.offset, origin = "start")
+  cd <- readBin(con, what = "raw", n = eocd$cd.size)
+
+  cdfh.sig <- as.raw(c(0x50, 0x4b, 0x01, 0x02))
+  names.out <- character(eocd$n.entries)
+  offsets.out <- numeric(eocd$n.entries)
+  sizes.out <- numeric(eocd$n.entries)
+  methods.out <- integer(eocd$n.entries)
+
+  pos <- 1L
+  i <- 0L
+  cd.len <- length(cd)
+  while (pos <= cd.len - 45L) {
+    if (!(cd[pos] == cdfh.sig[1] && cd[pos + 1L] == cdfh.sig[2] &&
+          cd[pos + 2L] == cdfh.sig[3] && cd[pos + 3L] == cdfh.sig[4])) {
+      break
+    }
+    i <- i + 1L
+    method <- .AteraLeU16(cd, pos + 10L)
+    csize <- .AteraLeU32(cd, pos + 20L)
+    usize <- .AteraLeU32(cd, pos + 24L)
+    fname.len <- .AteraLeU16(cd, pos + 28L)
+    extra.len <- .AteraLeU16(cd, pos + 30L)
+    comment.len <- .AteraLeU16(cd, pos + 32L)
+    lho <- .AteraLeU32(cd, pos + 42L)
+
+    name.start <- pos + 46L
+    name <- rawToChar(cd[name.start:(name.start + fname.len - 1L)])
+
+    if (extra.len > 0L) {
+      extra.start <- name.start + fname.len
+      extra <- cd[extra.start:(extra.start + extra.len - 1L)]
+      # walk extra-field sub-records looking for the Zip64 tag (0x0001);
+      # per the zip spec, only fields that were placeholder-valued in the
+      # fixed header are present here, in order: usize, csize, offset
+      ep <- 1L
+      while (ep <= length(extra) - 3L) {
+        tag <- .AteraLeU16(extra, ep)
+        sz <- .AteraLeU16(extra, ep + 2L)
+        if (tag == 1L) {
+          dp <- ep + 4L
+          if (usize >= 0xFFFFFFFF) { usize <- .AteraLeU64(extra, dp); dp <- dp + 8L }
+          if (csize >= 0xFFFFFFFF) { csize <- .AteraLeU64(extra, dp); dp <- dp + 8L }
+          if (lho >= 0xFFFFFFFF)   { lho   <- .AteraLeU64(extra, dp); dp <- dp + 8L }
+          break
+        }
+        ep <- ep + 4L + sz
+      }
+    }
+
+    names.out[i] <- name
+    offsets.out[i] <- lho
+    sizes.out[i] <- csize
+    methods.out[i] <- method
+
+    pos <- name.start + fname.len + extra.len + comment.len
+  }
+
+  if (i != eocd$n.entries) {
+    names.out <- names.out[seq_len(i)]
+    offsets.out <- offsets.out[seq_len(i)]
+    sizes.out <- sizes.out[seq_len(i)]
+    methods.out <- methods.out[seq_len(i)]
+  }
+  if (any(methods.out != 0L)) {
+    stop("Atera zarr.zip entries are expected to be stored (uncompressed by zip); found a deflated entry", call. = FALSE)
+  }
+
+  list(
+    name = names.out,
+    offset = offsets.out,
+    size = sizes.out,
+    lookup = as.list(setNames(seq_along(names.out), names.out))
+  )
+}
+
+#' Given a local file header offset (from the central directory), compute
+#' the byte offset where the entry's raw data actually begins (skipping the
+#' fixed 30-byte local header plus its variable name/extra fields)
+#'
+#' @keywords internal
+#' @noRd
+.AteraLocalDataOffset <- function(con, local.header.offset) {
+  seek(con, where = local.header.offset, origin = "start")
+  hdr <- readBin(con, what = "raw", n = 30L)
+  fname.len <- .AteraLeU16(hdr, 27L)
+  extra.len <- .AteraLeU16(hdr, 29L)
+  local.header.offset + 30L + fname.len + extra.len
+}
+
+#' Read one zip entry's raw bytes directly into memory (no disk
+#' extraction). \code{zidx} is a \code{.AteraZipIndex()} result; \code{con}
+#' is an open \code{file(zip.file, "rb")} connection. Returns \code{NULL}
+#' if the entry isn't present (eg a missing/all-fill-value zarr chunk).
+#'
+#' @keywords internal
+#' @noRd
+.AteraReadEntryRaw <- function(con, zidx, name) {
+  i <- zidx$lookup[[name]]
+  if (is.null(i)) {
+    return(NULL)
+  }
+  data.offset <- .AteraLocalDataOffset(con, zidx$offset[i])
+  seek(con, where = data.offset, origin = "start")
+  readBin(con, what = "raw", n = zidx$size[i])
+}
+
+#' @keywords internal
+#' @noRd
+.AteraReadJSON <- function(con, zidx, name) {
+  raw <- .AteraReadEntryRaw(con, zidx, name)
+  if (is.null(raw)) {
+    return(NULL)
+  }
+  jsonlite::fromJSON(rawToChar(raw), simplifyVector = TRUE)
+}
+
+#' R storage mode that a given zarr dtype string decodes to via
+#' \code{blosc::blosc_decompress}, used to pre-allocate output vectors
+#' without needing to decompress a chunk first. Note \code{<u4}/\code{<i8}/
+#' \code{<u8} all decode to \code{double}, since R has no native type wide
+#' enough to hold their full range losslessly.
+#'
+#' @keywords internal
+#' @noRd
+.AteraDtypeRType <- function(dtype) {
+  switch(
+    EXPR = dtype,
+    "|i1" = , "|u1" = , "<i2" = , "<u2" = , "<i4" = "integer",
+    "<u4" = , "<i8" = , "<u8" = , "<f2" = , "<f4" = , "<f8" = "double",
+    "|b1" = "logical",
+    stop("Unsupported zarr dtype: ", dtype, call. = FALSE)
+  )
+}
+
+#' Decode one already-Blosc-compressed chunk's raw bytes into a typed R
+#' vector, using the exact zarr dtype string from \code{.zarray} (eg
+#' \code{"<i4"}, \code{"<u4"}, \code{"<f4"}, \code{"|b1"}) so that
+#' \code{blosc}'s self-describing frame header drives decompression
+#'
+#' @keywords internal
+#' @noRd
+.AteraDecodeChunk <- function(raw, dtype, n) {
+  vals <- blosc::blosc_decompress(raw, dtype = dtype)
+  vals[seq_len(n)]
+}
+
+#' Read a zarr v2 array (1-D or 2-D), stored inside a zip archive, directly
+#' into memory with no disk extraction. \code{row.range} (1-based,
+#' inclusive \code{c(start, end)}) restricts which rows (first dimension)
+#' are decoded and returned; only chunks overlapping that range are
+#' read/decompressed, which is what makes gene-restricted transcript reads
+#' cheap. Missing chunks (sparse zarr arrays) are filled with the array's
+#' \code{fill_value}.
+#'
+#' @keywords internal
+#' @noRd
+.AteraReadArray <- function(con, zidx, array.path, row.range = NULL) {
+  meta <- .AteraReadJSON(con, zidx, paste0(array.path, "/.zarray"))
+  shape <- meta$shape
+  chunks <- meta$chunks
+  dtype <- meta$dtype
+  order <- if (is.null(meta$order)) "C" else meta$order
+  sep <- if (is.null(meta$dimension_separator)) "." else meta$dimension_separator
+  fill.value <- if (is.null(meta$fill_value)) 0 else meta$fill_value
+  ndim <- length(shape)
+
+  if (ndim == 1L) {
+    n <- shape[1L]
+    csize <- chunks[1L]
+    if (is.null(row.range)) row.range <- c(1L, n)
+    start <- row.range[1L]; end <- row.range[2L]
+    c.first <- (start - 1L) %/% csize
+    c.last <- (end - 1L) %/% csize
+    out <- vector(mode = .AteraDtypeRType(dtype), length = end - start + 1L)
+    for (ci in c.first:c.last) {
+      row0 <- ci * csize + 1L
+      actual.n <- min(csize, n - ci * csize)
+      key <- paste0(array.path, "/", ci)
+      raw.chunk <- .AteraReadEntryRaw(con, zidx, key)
+      vals <- if (is.null(raw.chunk)) rep(fill.value, actual.n) else .AteraDecodeChunk(raw.chunk, dtype, actual.n)
+      lo <- max(start, row0)
+      hi <- min(end, row0 + actual.n - 1L)
+      if (lo > hi) next
+      out[(lo - start + 1L):(hi - start + 1L)] <- vals[(lo - row0 + 1L):(hi - row0 + 1L)]
+    }
+    return(out)
+  }
+
+  if (ndim == 2L) {
+    nrow <- shape[1L]; ncol <- shape[2L]
+    crow <- chunks[1L]; ccol <- chunks[2L]
+    if (is.null(row.range)) row.range <- c(1L, nrow)
+    start <- row.range[1L]; end <- row.range[2L]
+    n.chunk.cols <- ceiling(ncol / ccol)
+    c.first <- (start - 1L) %/% crow
+    c.last <- (end - 1L) %/% crow
+    out <- matrix(vector(mode = .AteraDtypeRType(dtype), length = 1L), nrow = end - start + 1L, ncol = ncol)
+    for (ri in c.first:c.last) {
+      row0 <- ri * crow + 1L
+      actual.nrow <- min(crow, nrow - ri * crow)
+      lo <- max(start, row0)
+      hi <- min(end, row0 + actual.nrow - 1L)
+      if (lo > hi) next
+      for (ci in seq_len(n.chunk.cols) - 1L) {
+        col0 <- ci * ccol + 1L
+        actual.ncol <- min(ccol, ncol - ci * ccol)
+        key <- paste0(array.path, "/", ri, sep, ci)
+        raw.chunk <- .AteraReadEntryRaw(con, zidx, key)
+        n.vals <- actual.nrow * actual.ncol
+        vals <- if (is.null(raw.chunk)) rep(fill.value, n.vals) else .AteraDecodeChunk(raw.chunk, dtype, n.vals)
+        chunk.mat <- if (identical(order, "F")) {
+          matrix(vals, nrow = actual.nrow, ncol = actual.ncol)
+        } else {
+          t(matrix(vals, nrow = actual.ncol, ncol = actual.nrow))
+        }
+        out[(lo - start + 1L):(hi - start + 1L), col0:(col0 + actual.ncol - 1L)] <-
+          chunk.mat[(lo - row0 + 1L):(hi - row0 + 1L), , drop = FALSE]
+      }
+    }
+    return(out)
+  }
+
+  stop("Unsupported array rank: ", ndim, call. = FALSE)
+}
+
+#' Decode a numcodecs VLenUTF8-filtered, already-Blosc-decompressed byte
+#' buffer into a character vector: a \code{u32} count \code{N}, followed by
+#' \code{N} \code{(u32 len, len raw utf8 bytes)} records, with no padding
+#'
+#' @keywords internal
+#' @noRd
+.AteraDecodeVlenUtf8 <- function(raw.bytes) {
+  n <- as.integer(raw.bytes[1L]) + as.integer(raw.bytes[2L]) * 256L +
+    as.integer(raw.bytes[3L]) * 65536L + as.integer(raw.bytes[4L]) * 16777216L
+  strs <- character(n)
+  pos <- 5L
+  for (i in seq_len(n)) {
+    len <- as.integer(raw.bytes[pos]) + as.integer(raw.bytes[pos + 1L]) * 256L +
+      as.integer(raw.bytes[pos + 2L]) * 65536L + as.integer(raw.bytes[pos + 3L]) * 16777216L
+    pos <- pos + 4L
+    strs[i] <- rawToChar(raw.bytes[pos:(pos + len - 1L)])
+    pos <- pos + len
+  }
+  strs
+}
+
+#' Read a \code{|O} (vlen-utf8) 1-D string array, chunk by chunk
+#'
+#' @keywords internal
+#' @noRd
+.AteraReadStringArray <- function(con, zidx, array.path) {
+  meta <- .AteraReadJSON(con, zidx, paste0(array.path, "/.zarray"))
+  n <- meta$shape[1L]
+  csize <- meta$chunks[1L]
+  n.chunks <- ceiling(n / csize)
+  parts <- vector("list", n.chunks)
+  for (ci in seq_len(n.chunks) - 1L) {
+    key <- paste0(array.path, "/", ci)
+    raw.chunk <- .AteraReadEntryRaw(con, zidx, key)
+    dec <- blosc::blosc_decompress(raw.chunk)
+    parts[[ci + 1L]] <- .AteraDecodeVlenUtf8(dec)
+  }
+  unlist(parts, use.names = FALSE)
+}
+
+#' Read an AnnData-style categorical column (a subgroup containing
+#' \code{categories} and \code{codes} arrays) into an R factor
+#'
+#' @keywords internal
+#' @noRd
+.AteraReadCategorical <- function(con, zidx, group.path) {
+  cat.meta <- .AteraReadJSON(con, zidx, paste0(group.path, "/categories/.zarray"))
+  categories <- if (identical(cat.meta$dtype, "|O")) {
+    .AteraReadStringArray(con, zidx, paste0(group.path, "/categories"))
+  } else {
+    .AteraReadArray(con, zidx, paste0(group.path, "/categories"))
+  }
+  codes <- .AteraReadArray(con, zidx, paste0(group.path, "/codes"))
+  values <- rep_len(NA_character_, length(codes))
+  keep <- codes >= 0
+  values[keep] <- categories[codes[keep] + 1L]
+  factor(values, levels = categories)
+}
+
+#' Decode a two-column (low, high) packed-uint32 id array (a matrix, as
+#' returned by \code{.AteraReadArray}) into a single double id per row,
+#' mapping the "all bits set" sentinel to NA (unassigned). Ids that were
+#' stored as a plain (already-scalar) array are returned as-is.
+#'
+#' @keywords internal
+#' @noRd
+.AteraDecodePackedId <- function(ids) {
+  if (!is.matrix(x = ids)) {
+    return(ids)
+  }
+  sentinel <- 2^32 - 1
+  unassigned <- ids[, 1] == sentinel & ids[, 2] == sentinel
+  decoded <- ids[, 1] + ids[, 2] * 2^32
+  decoded[unassigned] <- NA
+  return(decoded)
+}
+
+#' Format a decoded numeric id as a string without falling back to
+#' scientific notation, so ids remain usable as matrix/data frame join keys
+#'
+#' @keywords internal
+#' @noRd
+.AteraFormatId <- function(ids) {
+  formatted <- sprintf(fmt = '%.0f', ids)
+  formatted[is.na(x = ids)] <- NA
+  return(formatted)
+}
+
+#' Enumerate the direct child entries (arrays or categorical subgroups) of
+#' a zarr group from an already-parsed zip index, without any additional
+#' I/O
+#'
+#' @keywords internal
+#' @noRd
+.AteraGroupEntries <- function(zidx, group.path) {
+  prefix <- paste0(group.path, "/")
+  matches <- zidx$name[startsWith(zidx$name, prefix)]
+  rest <- substring(matches, nchar(prefix) + 1L)
+  first.seg <- sub("/.*$", "", rest)
+  setdiff(unique(first.seg), c(".zgroup", ".zattrs", ".zarray"))
+}
+
+#' Read a flat AnnData-style zarr group (eg \code{obs}/\code{var}) into a
+#' data frame; plain columns are zarr arrays (string arrays use the
+#' vlen-utf8 filter), categorical columns are subgroups containing
+#' \code{categories} and \code{codes} arrays
+#'
+#' @keywords internal
+#' @noRd
+.AteraReadFlatGroup <- function(con, zidx, group.path, columns = NULL) {
+  entries <- .AteraGroupEntries(zidx, group.path)
+  if (!is.null(x = columns)) {
+    entries <- intersect(x = entries, y = columns)
+  }
+  cols <- list()
+  for (e in entries) {
+    epath <- paste0(group.path, "/", e)
+    if (!is.null(zidx$lookup[[paste0(epath, "/.zarray")]])) {
+      meta <- .AteraReadJSON(con, zidx, paste0(epath, "/.zarray"))
+      cols[[e]] <- if (identical(meta$dtype, "|O")) {
+        .AteraReadStringArray(con, zidx, epath)
+      } else {
+        .AteraReadArray(con, zidx, epath)
+      }
+    } else if (!is.null(zidx$lookup[[paste0(epath, "/categories/.zarray")]])) {
+      cols[[e]] <- .AteraReadCategorical(con, zidx, epath)
+    }
+  }
+  return(as.data.frame(x = cols, stringsAsFactors = FALSE, check.names = FALSE))
+}
+
+#' Read one of Atera's flat (non-gridded) segmentation polygon sets
+#' (\code{polygon_sets/0} = nucleus, \code{polygon_sets/1} = cell) into a
+#' long-format data frame of \code{cell}/\code{x}/\code{y}, one row per
+#' polygon vertex, joined against \code{cell.id} (a formatted, decoded
+#' \code{cell_id} vector read from the same \code{cells.zarr.zip}) by
+#' 0-based row index -- not assumed to be in the same row order as any
+#' other file
+#'
+#' @keywords internal
+#' @noRd
+.AteraReadPolygonSet <- function(con, zidx, set.idx, cell.id) {
+  base <- paste0("polygon_sets/", set.idx)
+  cell_index <- .AteraReadArray(con, zidx, paste0(base, "/cell_index"))
+  num_vertices <- .AteraReadArray(con, zidx, paste0(base, "/num_vertices"))
+  vertices <- .AteraReadArray(con, zidx, paste0(base, "/vertices"))
+
+  n <- nrow(vertices)
+  poly.idx <- rep(seq_len(n), num_vertices)
+  vert.idx <- sequence(num_vertices)
+  col.x <- (vert.idx - 1L) * 2L + 1L
+  col.y <- (vert.idx - 1L) * 2L + 2L
+
+  data.frame(
+    cell = cell.id[cell_index[poly.idx] + 1L],
+    x = vertices[cbind(poly.idx, col.x)],
+    y = vertices[cbind(poly.idx, col.y)]
+  )
+}
+
+#' Build a cheap, reusable handle onto a \code{transcripts.zarr.zip}: parses
+#' the zip's central directory and each grid tile's (tiny) \code{gene_offset}
+#' index up front, but reads no \code{location}/\code{quality_score} data.
+#' Used to defer the expensive part of transcript loading (decoding
+#' \code{location}/\code{quality_score} chunks) until specific genes are
+#' actually requested, so \code{molecule.coordinates = TRUE} doesn't have to
+#' materialize the full transcript table just to be usable later.
+#'
+#' @keywords internal
+#' @noRd
+.AteraMoleculesHandle <- function(data.dir, mols.qv.threshold = 20) {
+  zip.file <- file.path(data.dir, "transcripts.zarr.zip")
+  zidx <- .AteraZipIndex(zip.file)
+  con <- file(zip.file, "rb")
+  on.exit(close(con))
+
+  attrs <- .AteraReadJSON(con, zidx, ".zattrs")
+  gene.names <- unlist(attrs$gene_names)
+
+  grid.entries <- grep("^grid/[^/.]", zidx$name, value = TRUE)
+  tile.dirs <- unique(vapply(
+    strsplit(grid.entries, "/"),
+    function(p) paste(p[1:2], collapse = "/"),
+    character(1)
+  ))
+  tiles <- lapply(tile.dirs, function(tile.dir) {
+    list(dir = tile.dir, gene_offset = .AteraReadArray(con, zidx, paste0(tile.dir, "/gene_offset")))
+  })
+
+  structure(
+    list(
+      zip.file = zip.file,
+      zidx = zidx,
+      gene.names = gene.names,
+      tiles = tiles,
+      mols.qv.threshold = mols.qv.threshold
+    ),
+    class = "AteraMoleculesHandle"
+  )
+}
+
+#' Fetch transcript molecule coordinates from an \code{.AteraMoleculesHandle}
+#' for \code{genes} (or all genes, if \code{NULL}), reading only the
+#' (gene-sorted, contiguous) chunks needed for the requested genes out of
+#' each grid tile
+#'
+#' @keywords internal
+#' @noRd
+.AteraFetchMolecules <- function(handle, genes = NULL) {
+  con <- file(handle$zip.file, "rb")
+  on.exit(close(con))
+
+  tile.dfs <- lapply(handle$tiles, function(tile) {
+    gene_offset <- tile$gene_offset
+    if (is.null(genes)) {
+      location <- .AteraReadArray(con, handle$zidx, paste0(tile$dir, "/location"))
+      quality_score <- .AteraReadArray(con, handle$zidx, paste0(tile$dir, "/quality_score"))
+      gene.idx <- rep(seq_len(nrow(gene_offset)), gene_offset[, 2] - gene_offset[, 1])
+      return(data.frame(
+        x = location[, 1],
+        y = location[, 2],
+        gene = handle$gene.names[gene.idx],
+        qv = as.vector(quality_score)
+      ))
+    }
+    gene.rows <- match(genes, handle$gene.names)
+    gene.rows <- gene.rows[!is.na(gene.rows) & (gene_offset[gene.rows, 2] - gene_offset[gene.rows, 1]) > 0]
+    if (length(gene.rows) == 0) {
+      return(data.frame(x = numeric(0), y = numeric(0), gene = character(0), qv = numeric(0)))
+    }
+    gene.dfs <- lapply(gene.rows, function(g) {
+      rows <- c(gene_offset[g, 1] + 1L, gene_offset[g, 2])
+      loc <- .AteraReadArray(con, handle$zidx, paste0(tile$dir, "/location"), row.range = rows)
+      qv <- .AteraReadArray(con, handle$zidx, paste0(tile$dir, "/quality_score"), row.range = rows)
+      data.frame(x = loc[, 1], y = loc[, 2], gene = handle$gene.names[g], qv = as.vector(qv))
+    })
+    data.table::rbindlist(gene.dfs)
+  })
+
+  df <- as.data.frame(data.table::rbindlist(tile.dfs))
+  if (!is.null(handle$mols.qv.threshold)) {
+    df <- df[!is.na(df$gene) & df$qv >= handle$mols.qv.threshold, , drop = FALSE]
+  } else {
+    df <- df[!is.na(df$gene), , drop = FALSE]
+  }
+  df$qv <- NULL
+  df
+}
+
+#' Load Atera spatial data
+#'
+#' Read the output of \href{https://www.10xgenomics.com}{10x Genomics} Atera,
+#' a next-generation in situ sequencing platform. All Atera outputs (aside
+#' from images) are stored in AnnData zarr (storage format v2) files, zipped
+#' with \code{Stored} (uncompressed) zip entries; reading them requires the
+#' \code{blosc} and \code{jsonlite} packages. Zarr chunks are read directly
+#' out of the zip archive by byte-range seeks with no disk extraction.
+#'
+#' @param data.dir Directory containing all Atera output files with default
+#' filenames
+#' @param outs Types of outputs to read; choose one or more of:
+#' \itemize{
+#'  \item \dQuote{matrix}: the counts matrix
+#'  \item \dQuote{centroids}: cell centroids in micron coordinate space
+#'  \item \dQuote{segmentations}: cell segmentation boundary polygons in
+#'  micron coordinate space
+#'  \item \dQuote{nucleus_segmentations}: nucleus segmentation boundary
+#'  polygons in micron coordinate space. Cells may have zero, one, or more
+#'  than one nucleus polygon
+#'  \item \dQuote{microns}: transcript molecule coordinates. This is
+#'  optional as transcripts files can be very large.
+#' }
+#' @param mols.qv.threshold Remove transcript molecules with a calibrated
+#' Q-score less than this threshold when reading \dQuote{microns}. Set to
+#' \code{NULL} to disable filtering.
+#' @param genes Optional character vector of gene names to restrict
+#' \dQuote{microns} to. When set, only the chunks spanning each requested
+#' gene's (gene-sorted, contiguous) row range are read/decompressed instead
+#' of the full transcript table; this avoids materializing all rows when
+#' only a handful of genes are needed. Ignored when \code{"microns"} is not
+#' in \code{outs}.
+#'
+#' @return \code{ReadAtera}: A list with some combination of the following
+#' values:
+#' \itemize{
+#'  \item \dQuote{\code{matrix}}: a named list of
+#'  \link[Matrix:dgCMatrix-class]{sparse matrices} with expression data, one
+#'  per feature type (eg \dQuote{Gene Expression}); cells are columns and
+#'  features are rows
+#'  \item \dQuote{\code{centroids}}: a data frame with cell centroid
+#'  coordinates in three columns: \dQuote{x}, \dQuote{y}, and \dQuote{cell}
+#'  \item \dQuote{\code{segmentations}}/\dQuote{\code{nucleus_segmentations}}:
+#'  a data frame with one row per polygon vertex, in three columns:
+#'  \dQuote{cell}, \dQuote{x}, and \dQuote{y}
+#'  \item \dQuote{\code{microns}}: a data frame with transcript coordinates
+#'  in three columns: \dQuote{x}, \dQuote{y}, and \dQuote{gene}
+#' }
+#'
+#' @export
+#' @concept preprocessing
+#'
+ReadAtera <- function(
+  data.dir,
+  outs = c("matrix", "centroids"),
+  mols.qv.threshold = 20,
+  genes = NULL
+) {
+  outs <- match.arg(
+    arg = outs,
+    choices = c("matrix", "centroids", "segmentations", "nucleus_segmentations", "microns"),
+    several.ok = TRUE
+  )
+
+  .AteraCheckDeps()
+
+  data <- sapply(outs, function(otype) {
+    switch(
+      EXPR = otype,
+      'matrix' = {
+        pmtx <- progressor()
+        pmtx(message = 'Reading counts matrix', class = 'sticky', amount = 0)
+
+        zip.file <- file.path(data.dir, "csc_cell_feature_matrix.zarr.zip")
+        zidx <- .AteraZipIndex(zip.file)
+        con <- file(zip.file, "rb")
+        on.exit(close(con), add = TRUE)
+
+        obs <- .AteraReadFlatGroup(con, zidx, "obs", columns = "cell_id")
+        var <- .AteraReadFlatGroup(con, zidx, "var", columns = c("feature_name", "feature_type"))
+
+        x.data <- .AteraReadArray(con, zidx, "X/data")
+        x.indices <- .AteraReadArray(con, zidx, "X/indices")
+        x.indptr <- .AteraReadArray(con, zidx, "X/indptr")
+
+        mtx <- new(
+          Class = "dgRMatrix",
+          j = as.integer(x.indices),
+          p = as.integer(x.indptr),
+          x = as.double(x.data),
+          Dim = c(nrow(var), nrow(obs))
+        )
+        mtx <- as(mtx, "CsparseMatrix")
+        rownames(mtx) <- var$feature_name
+        colnames(mtx) <- .AteraFormatId(.AteraDecodePackedId(obs$cell_id))
+
+        pmtx(type = "finish")
+
+        sapply(
+          X = intersect(levels(var$feature_type), unique(as.character(var$feature_type))),
+          FUN = function(ft) mtx[var$feature_type == ft, , drop = FALSE],
+          simplify = FALSE,
+          USE.NAMES = TRUE
+        )
+      },
+      'centroids' = {
+        pcents <- progressor()
+        pcents(message = 'Loading cell centroids', class = 'sticky', amount = 0)
+
+        zip.file <- file.path(data.dir, "cells.zarr.zip")
+        zidx <- .AteraZipIndex(zip.file)
+        con <- file(zip.file, "rb")
+        on.exit(close(con), add = TRUE)
+
+        cell_id <- .AteraDecodePackedId(.AteraReadArray(con, zidx, "cell_id"))
+        cell_summary <- .AteraReadArray(con, zidx, "cell_summary")
+
+        pcents(type = 'finish')
+
+        data.frame(
+          x = cell_summary[, 1],
+          y = cell_summary[, 2],
+          cell = .AteraFormatId(cell_id)
+        )
+      },
+      'segmentations' = ,
+      'nucleus_segmentations' = {
+        pseg <- progressor()
+        pseg(
+          message = if (otype == 'segmentations') 'Loading cell segmentations' else 'Loading nucleus segmentations',
+          class = 'sticky',
+          amount = 0
+        )
+
+        zip.file <- file.path(data.dir, "cells.zarr.zip")
+        zidx <- .AteraZipIndex(zip.file)
+        con <- file(zip.file, "rb")
+        on.exit(close(con), add = TRUE)
+
+        cell_id <- .AteraFormatId(.AteraDecodePackedId(.AteraReadArray(con, zidx, "cell_id")))
+        set.idx <- if (otype == 'segmentations') 1L else 0L
+        df <- .AteraReadPolygonSet(con, zidx, set.idx, cell_id)
+
+        pseg(type = 'finish')
+
+        df
+      },
+      'microns' = {
+        pmicrons <- progressor()
+        pmicrons(message = "Loading transcript coordinates", class = 'sticky', amount = 0)
+
+        handle <- .AteraMoleculesHandle(data.dir = data.dir, mols.qv.threshold = mols.qv.threshold)
+        df <- .AteraFetchMolecules(handle = handle, genes = genes)
+
+        pmicrons(type = 'finish')
+
+        df
+      },
+      stop("Unknown Atera input type: ", otype)
+    )
+  }, simplify = FALSE, USE.NAMES = TRUE)
+
+  metadata <- file.path(data.dir, "experiment.spatial")
+  if (file.exists(metadata) && requireNamespace("jsonlite", quietly = TRUE)) {
+    meta <- jsonlite::read_json(metadata)
+    data$metadata <- meta[
+      intersect(
+        names(meta),
+        c(
+          'run_name', 'slide_name', 'region_name', 'chemistry_version',
+          'num_cells', 'num_transcripts'
+        )
+      )
+    ]
+    if (!is.null(meta$panel_a)) {
+      data$metadata$panel_name <- meta$panel_a$panel_name
+    }
+  }
+  return(data)
+}
+
 #' Load Slide-seq spatial data
 #'
 #' @param coord.file Path to csv file containing bead coordinate positions

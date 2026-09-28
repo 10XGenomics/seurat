@@ -96,6 +96,7 @@ Suggests:
     base64enc,
     Biobase,
     BiocGenerics,
+    blosc,
     BPCells,
     data.table,
     DESeq2,

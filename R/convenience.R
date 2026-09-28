@@ -282,6 +282,169 @@ LoadXenium <- function(
   return(xenium.obj)
 }
 
+#' @return \code{LoadAtera}: A \code{\link[SeuratObject]{Seurat}} object
+#'
+#' @param data.dir Path to folder containing Atera outputs
+#' @param fov FOV name
+#' @param assay Assay name
+#' @param mols.qv.threshold Remove transcript molecules with a calibrated
+#' Q-score less than this threshold
+#' @param cell.centroids Whether or not to load cell centroids
+#' @param molecule.coordinates Whether or not to load transcript molecule
+#' coordinates
+#' @param segmentations Which segmentation boundary polygons to load, one
+#' of \dQuote{cell} or \dQuote{nucleus}, or \code{NULL} to load none
+#' @param genes Optional character vector of gene names to restrict the
+#' initial \code{molecule.coordinates} load to. When \code{molecule.coordinates
+#' = TRUE}, a lazy, on-disk handle onto the transcript table is always kept
+#' on the returned object (regardless of whether \code{genes} is set), so
+#' additional genes can be fetched later with \code{\link{LoadAteraMolecules}}
+#' without re-reading genes already fetched. See \code{\link{ReadAtera}}
+#'
+#' @importFrom SeuratObject Cells CreateCentroids CreateFOV CreateSegmentation
+#' CreateSeuratObject CreateMolecules
+#'
+#' @export
+#'
+#' @rdname ReadAtera
+#'
+LoadAtera <- function(
+  data.dir,
+  fov = 'fov',
+  assay = 'Atera',
+  mols.qv.threshold = 20,
+  cell.centroids = TRUE,
+  molecule.coordinates = FALSE,
+  segmentations = NULL,
+  genes = NULL
+) {
+  if (!is.null(segmentations) && !(segmentations %in% c('nucleus', 'cell'))) {
+    stop('segmentations must be NULL or one of "nucleus", "cell"')
+  }
+
+  if (!cell.centroids && is.null(segmentations)) {
+    stop("Must load either centroids or cell/nucleus segmentations")
+  }
+
+  data <- ReadAtera(
+    data.dir = data.dir,
+    outs = c("matrix", "centroids", "segmentations", "nucleus_segmentations")[
+      c(TRUE, cell.centroids, isTRUE(segmentations == 'cell'), isTRUE(segmentations == 'nucleus'))
+    ],
+    mols.qv.threshold = mols.qv.threshold
+  )
+  mols.handle <- NULL
+  if (molecule.coordinates) {
+    .AteraCheckDeps()
+    mols.handle <- .AteraMoleculesHandle(data.dir = data.dir, mols.qv.threshold = mols.qv.threshold)
+    if (!is.null(genes)) {
+      data$microns <- .AteraFetchMolecules(handle = mols.handle, genes = genes)
+    }
+  }
+
+  segmentations.key <- intersect(c("segmentations", "nucleus_segmentations"), names(data))
+
+  segmentations.data <- Filter(Negate(is.null), list(
+    centroids = if (is.null(data$centroids)) {
+      NULL
+    } else {
+      CreateCentroids(data$centroids)
+    },
+    segmentations = if (length(segmentations.key) > 0) {
+      CreateSegmentation(data[[segmentations.key]])
+    } else {
+      NULL
+    }
+  ))
+
+  coords <- CreateFOV(
+    segmentations.data,
+    assay = assay,
+    molecules = if (is.null(data$microns)) {
+      NULL
+    } else {
+      CreateMolecules(data$microns)
+    }
+  )
+
+  slot.map <- c(
+    `Deprecated Codeword` = 'DeprecatedCodeword',
+    `Unassigned Codeword` = 'BlankCodeword',
+    `Negative Control Codeword` = 'ControlCodeword',
+    `Negative Control Probe` = 'ControlProbe',
+    `Genomic Control` = 'GenomicControl'
+  )
+
+  atera.obj <- CreateSeuratObject(counts = data$matrix[["Gene Expression"]], assay = assay)
+
+  if (!is.null(data$metadata)) {
+    Misc(atera.obj, 'run_metadata') <- data$metadata
+  }
+
+  for (name in intersect(names(slot.map), names(data$matrix))) {
+    atera.obj[[slot.map[name]]] <- CreateAssayObject(counts = data$matrix[[name]])
+  }
+
+  atera.obj <- subset(atera.obj, cells = intersect(Cells(atera.obj), Cells(coords)))
+  coords <- subset(coords, cells = intersect(Cells(atera.obj), Cells(coords)))
+
+  atera.obj[[fov]] <- coords
+
+  if (!is.null(mols.handle)) {
+    Misc(atera.obj, 'atera.molecules') <- list(handle = mols.handle, cache = data$microns, fov = fov)
+  }
+
+  return(atera.obj)
+}
+
+#' Fetch additional Atera transcript molecules for genes not yet loaded
+#'
+#' Fetches transcript molecule coordinates for \code{genes} and adds them to
+#' the molecule layer of a Seurat object created by
+#' \code{\link{LoadAtera}(..., molecule.coordinates = TRUE)}, without
+#' re-reading genes that have already been fetched (by this call or by
+#' \code{genes} at load time). This is meant for interactive exploration,
+#' where different genes are plotted one at a time and reloading the full
+#' transcript table for each one would be wasteful.
+#'
+#' @param object A Seurat object created by \code{LoadAtera(..., molecule.coordinates = TRUE)}
+#' @param genes Character vector of gene names to fetch
+#'
+#' @return \code{object}, with \code{genes}' transcript coordinates added to
+#' its molecule layer (in addition to any genes fetched by a previous call)
+#'
+#' @importFrom SeuratObject CreateMolecules
+#'
+#' @export
+#'
+LoadAteraMolecules <- function(object, genes) {
+  handle.info <- Misc(object, slot = 'atera.molecules')
+  if (is.null(handle.info)) {
+    stop(
+      "'object' was not loaded with LoadAtera(..., molecule.coordinates = TRUE)",
+      call. = FALSE
+    )
+  }
+
+  cached.genes <- if (is.null(handle.info$cache)) character(0) else unique(handle.info$cache$gene)
+  missing.genes <- setdiff(genes, cached.genes)
+  if (length(missing.genes) > 0) {
+    new.df <- .AteraFetchMolecules(handle = handle.info$handle, genes = missing.genes)
+    handle.info$cache <- if (is.null(handle.info$cache)) {
+      new.df
+    } else {
+      rbind(handle.info$cache, new.df)
+    }
+  }
+
+  object[[handle.info$fov]]@molecules <- list(
+    molecules = CreateMolecules(handle.info$cache, key = 'mols_')
+  )
+  Misc(object, 'atera.molecules') <- handle.info
+
+  return(object)
+}
+
 #' @param ... Extra parameters passed to \code{DimHeatmap}
 #'
 #' @rdname DimHeatmap
