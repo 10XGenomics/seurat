@@ -300,9 +300,20 @@ LoadXenium <- function(
 #' on the returned object (regardless of whether \code{genes} is set), so
 #' additional genes can be fetched later with \code{\link{LoadAteraMolecules}}
 #' without re-reading genes already fetched. See \code{\link{ReadAtera}}
+#' @param feature.types Optional character vector of feature types to
+#' restrict the counts matrix to (eg \dQuote{Gene Expression}); \code{NULL}
+#' (the default) loads all feature types, matching current behavior.
+#' \dQuote{Gene Expression} is always included, since it backs the object's
+#' primary assay. See \code{\link{ReadAtera}}
+#' @param bpcells.dir Path to a directory used to cache the counts matrix on
+#' disk via \code{BPCells}. \code{NULL} (the default) auto-selects a
+#' session-scoped cache directory so the returned object is BPCells-backed
+#' and lazy by default (even for small bundles) whenever \code{BPCells} is
+#' installed; pass \code{FALSE} to always get plain in-memory matrices
+#' instead. See \code{\link{ReadAtera}}
 #'
 #' @importFrom SeuratObject Cells CreateCentroids CreateFOV CreateSegmentation
-#' CreateSeuratObject CreateMolecules
+#' CreateSeuratObject CreateAssay5Object CreateMolecules
 #'
 #' @export
 #'
@@ -316,7 +327,9 @@ LoadAtera <- function(
   cell.centroids = TRUE,
   molecule.coordinates = FALSE,
   segmentations = NULL,
-  genes = NULL
+  genes = NULL,
+  feature.types = NULL,
+  bpcells.dir = NULL
 ) {
   if (!is.null(segmentations) && !(segmentations %in% c('nucleus', 'cell'))) {
     stop('segmentations must be NULL or one of "nucleus", "cell"')
@@ -326,12 +339,18 @@ LoadAtera <- function(
     stop("Must load either centroids or cell/nucleus segmentations")
   }
 
+  if (!is.null(feature.types)) {
+    feature.types <- union(feature.types, "Gene Expression")
+  }
+
   data <- ReadAtera(
     data.dir = data.dir,
     outs = c("matrix", "centroids", "segmentations", "nucleus_segmentations")[
       c(TRUE, cell.centroids, isTRUE(segmentations == 'cell'), isTRUE(segmentations == 'nucleus'))
     ],
-    mols.qv.threshold = mols.qv.threshold
+    mols.qv.threshold = mols.qv.threshold,
+    feature.types = feature.types,
+    bpcells.dir = bpcells.dir
   )
   mols.handle <- NULL
   if (molecule.coordinates) {
@@ -382,7 +401,15 @@ LoadAtera <- function(
   }
 
   for (name in intersect(names(slot.map), names(data$matrix))) {
-    atera.obj[[slot.map[name]]] <- CreateAssayObject(counts = data$matrix[[name]])
+    mtx <- data$matrix[[name]]
+    # CreateAssay5Object errors on single-feature layers ("Layers must be
+    # two-dimensional objects"); Assay (v3) handles this edge case fine, and
+    # the laziness benefit of Assay5/BPCells is negligible for a single row.
+    atera.obj[[slot.map[name]]] <- if (nrow(mtx) == 1L) {
+      CreateAssayObject(counts = mtx)
+    } else {
+      CreateAssay5Object(counts = mtx)
+    }
   }
 
   atera.obj <- subset(atera.obj, cells = intersect(Cells(atera.obj), Cells(coords)))
