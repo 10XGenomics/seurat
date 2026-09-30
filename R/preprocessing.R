@@ -3148,6 +3148,23 @@ ReadXenium <- function(
   vals[seq_len(n)]
 }
 
+#' Number of worker processes to use for \code{.AteraReadArray}'s
+#' Blosc-decompression step, honoring the package-wide \code{getThreads()}/
+#' \code{setThreads()} option so it stays consistent with the rest of
+#' Seurat's multithreading rather than defaulting to its own value.
+#' \code{parallel::mclapply} is fork-based and unsupported on Windows, so
+#' threading is disabled there instead of being requested and silently
+#' downgraded.
+#'
+#' @keywords internal
+#' @noRd
+.AteraThreads <- function() {
+  if (.Platform$OS.type == "windows") {
+    return(1L)
+  }
+  min(getThreads(), parallel::detectCores(), na.rm = TRUE)
+}
+
 #' Read a zarr v2 array (1-D or 2-D), stored inside a zip archive, directly
 #' into memory with no disk extraction. \code{row.range} (1-based,
 #' inclusive \code{c(start, end)}) restricts which rows (first dimension)
@@ -3168,6 +3185,16 @@ ReadXenium <- function(
   fill.value <- if (is.null(meta$fill_value)) 0 else meta$fill_value
   ndim <- length(shape)
 
+  # Chunk decoding is split into two phases so no I/O happens inside forked
+  # workers: `con` is a single connection shared across this whole call, and
+  # a `parallel::mclapply`/`mcmapply` fork inherits the *same* underlying
+  # open file description, so concurrent seek()/readBin() calls from forked
+  # children would race on that shared position and return corrupted bytes.
+  # Phase 1 (below, sequential) reads each chunk's raw bytes through `con`;
+  # phase 2 (`decode()`, possibly parallel) only touches those in-memory raw
+  # vectors, which is safe to fork over.
+  nthreads <- .AteraThreads()
+
   if (ndim == 1L) {
     n <- shape[1L]
     csize <- chunks[1L]
@@ -3175,13 +3202,25 @@ ReadXenium <- function(
     start <- row.range[1L]; end <- row.range[2L]
     c.first <- (start - 1L) %/% csize
     c.last <- (end - 1L) %/% csize
+    chunk.idx <- c.first:c.last
+    raw.chunks <- lapply(chunk.idx, function(ci) {
+      .AteraReadEntryRaw(con, zidx, paste0(array.path, "/", ci))
+    })
+    actual.ns <- vapply(chunk.idx, function(ci) min(csize, n - ci * csize), integer(1L))
+    decode <- function(raw.chunk, actual.n) {
+      if (is.null(raw.chunk)) rep(fill.value, actual.n) else .AteraDecodeChunk(raw.chunk, dtype, actual.n)
+    }
+    decoded <- if (length(raw.chunks) > 1L && nthreads > 1L) {
+      parallel::mcmapply(decode, raw.chunks, actual.ns, SIMPLIFY = FALSE, mc.cores = nthreads)
+    } else {
+      Map(decode, raw.chunks, actual.ns)
+    }
     out <- vector(mode = .AteraDtypeRType(dtype), length = end - start + 1L)
-    for (ci in c.first:c.last) {
+    for (k in seq_along(chunk.idx)) {
+      ci <- chunk.idx[k]
       row0 <- ci * csize + 1L
-      actual.n <- min(csize, n - ci * csize)
-      key <- paste0(array.path, "/", ci)
-      raw.chunk <- .AteraReadEntryRaw(con, zidx, key)
-      vals <- if (is.null(raw.chunk)) rep(fill.value, actual.n) else .AteraDecodeChunk(raw.chunk, dtype, actual.n)
+      actual.n <- actual.ns[k]
+      vals <- decoded[[k]]
       lo <- max(start, row0)
       hi <- min(end, row0 + actual.n - 1L)
       if (lo > hi) next
@@ -3198,7 +3237,8 @@ ReadXenium <- function(
     n.chunk.cols <- ceiling(ncol / ccol)
     c.first <- (start - 1L) %/% crow
     c.last <- (end - 1L) %/% crow
-    out <- matrix(vector(mode = .AteraDtypeRType(dtype), length = 1L), nrow = end - start + 1L, ncol = ncol)
+
+    jobs <- list()
     for (ri in c.first:c.last) {
       row0 <- ri * crow + 1L
       actual.nrow <- min(crow, nrow - ri * crow)
@@ -3210,16 +3250,36 @@ ReadXenium <- function(
         actual.ncol <- min(ccol, ncol - ci * ccol)
         key <- paste0(array.path, "/", ri, sep, ci)
         raw.chunk <- .AteraReadEntryRaw(con, zidx, key)
-        n.vals <- actual.nrow * actual.ncol
-        vals <- if (is.null(raw.chunk)) rep(fill.value, n.vals) else .AteraDecodeChunk(raw.chunk, dtype, n.vals)
-        chunk.mat <- if (identical(order, "F")) {
-          matrix(vals, nrow = actual.nrow, ncol = actual.ncol)
-        } else {
-          t(matrix(vals, nrow = actual.ncol, ncol = actual.nrow))
-        }
-        out[(lo - start + 1L):(hi - start + 1L), col0:(col0 + actual.ncol - 1L)] <-
-          chunk.mat[(lo - row0 + 1L):(hi - row0 + 1L), , drop = FALSE]
+        jobs[[length(jobs) + 1L]] <- list(
+          raw = raw.chunk,
+          n = actual.nrow * actual.ncol,
+          nrow = actual.nrow,
+          ncol = actual.ncol,
+          row0 = row0, col0 = col0, lo = lo, hi = hi
+        )
       }
+    }
+
+    decode <- function(job) {
+      if (is.null(job$raw)) rep(fill.value, job$n) else .AteraDecodeChunk(job$raw, dtype, job$n)
+    }
+    decoded <- if (length(jobs) > 1L && nthreads > 1L) {
+      parallel::mclapply(jobs, decode, mc.cores = nthreads)
+    } else {
+      lapply(jobs, decode)
+    }
+
+    out <- matrix(vector(mode = .AteraDtypeRType(dtype), length = 1L), nrow = end - start + 1L, ncol = ncol)
+    for (k in seq_along(jobs)) {
+      job <- jobs[[k]]
+      vals <- decoded[[k]]
+      chunk.mat <- if (identical(order, "F")) {
+        matrix(vals, nrow = job$nrow, ncol = job$ncol)
+      } else {
+        t(matrix(vals, nrow = job$ncol, ncol = job$nrow))
+      }
+      out[(job$lo - start + 1L):(job$hi - start + 1L), job$col0:(job$col0 + job$ncol - 1L)] <-
+        chunk.mat[(job$lo - job$row0 + 1L):(job$hi - job$row0 + 1L), , drop = FALSE]
     }
     return(out)
   }
