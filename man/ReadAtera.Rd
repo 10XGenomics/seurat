@@ -13,14 +13,18 @@ LoadAtera(
   cell.centroids = TRUE,
   molecule.coordinates = FALSE,
   segmentations = NULL,
-  genes = NULL
+  genes = NULL,
+  feature.types = NULL,
+  bpcells.dir = NULL
 )
 
 ReadAtera(
   data.dir,
   outs = c("matrix", "centroids"),
   mols.qv.threshold = 20,
-  genes = NULL
+  genes = NULL,
+  feature.types = NULL,
+  bpcells.dir = NULL
 )
 }
 \arguments{
@@ -49,6 +53,28 @@ gene's (gene-sorted, contiguous) row range are read/decompressed instead
 of the full transcript table; this avoids materializing all rows when
 only a handful of genes are needed. Ignored when \code{"microns"} is not
 in \code{outs}.}
+
+\item{feature.types}{Optional character vector of feature types (eg
+\dQuote{Gene Expression}) to restrict \dQuote{matrix} to. When set, only
+the (contiguous) rows for the requested feature type(s) are
+read/decompressed instead of the full counts matrix. Defaults to
+\code{NULL}, which reads all feature types (current/default behavior).
+Ignored when \code{"matrix"} is not in \code{outs}.}
+
+\item{bpcells.dir}{Path to a directory used to cache the counts matrix on
+disk, one subdirectory per feature type, via
+\link[BPCells:write_matrix_dir]{BPCells}. When set, a feature type already
+cached under this directory is opened directly with
+\link[BPCells:open_matrix_dir]{BPCells::open_matrix_dir} (no zarr read at
+all); a feature type not yet cached is read as usual and then written to
+this directory for reuse by later calls. Defaults to \code{NULL}, which
+auto-selects a session-scoped cache directory under \code{tempdir()} (so
+matrices are BPCells-backed, on-disk, and lazy by default, even for small
+bundles) if the \code{BPCells} package is installed, or falls back to
+in-memory sparse matrices (with a one-time message) if it isn't. Pass
+\code{FALSE} to explicitly opt out and always return in-memory sparse
+matrices, without requiring \code{BPCells} at all. Ignored when
+\code{"matrix"} is not in \code{outs}.}
 
 \item{outs}{Types of outputs to read; choose one or more of:
 \itemize{

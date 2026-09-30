@@ -3478,6 +3478,200 @@ ReadXenium <- function(
   df
 }
 
+#' Turn a feature type name (eg \dQuote{Negative Control Probe}) into a
+#' filesystem-safe directory name for use under \code{bpcells.dir}
+#'
+#' @keywords internal
+#' @noRd
+.AteraSanitizeName <- function(x) {
+  gsub("[^A-Za-z0-9]+", "_", x)
+}
+
+#' Check that the \code{BPCells} package is installed; only called when a
+#' \code{bpcells.dir} cache is actually requested
+#'
+#' @keywords internal
+#' @noRd
+.AteraCheckBPCellsDeps <- function() {
+  if (!requireNamespace('BPCells', quietly = TRUE)) {
+    stop("Reading/writing an Atera bpcells.dir cache requires the 'BPCells' package", call. = FALSE)
+  }
+}
+
+#' Default, session-scoped \code{bpcells.dir} used when the caller hasn't
+#' specified one: a subdirectory of \code{tempdir()} keyed off
+#' \code{data.dir}, so repeated \code{LoadAtera()}/\code{ReadAtera()} calls
+#' against the same bundle within a session reuse the same on-disk cache.
+#'
+#' @keywords internal
+#' @noRd
+.AteraDefaultBPCellsDir <- function(data.dir) {
+  file.path(tempdir(), "atera_bpcells", .AteraSanitizeName(normalizePath(data.dir, mustWork = FALSE)))
+}
+
+#' Resolve the effective \code{bpcells.dir} to use, applying the
+#' always-on-by-default policy: \code{NULL} (the parameter default) means
+#' "cache on disk via BPCells if it's installed", falling back to in-memory
+#' matrices with a one-time message if it isn't. Passing \code{FALSE}
+#' explicitly opts out of BPCells entirely (plain in-memory matrices, no
+#' dependency on the package). Any other value is used as-is, as an explicit
+#' cache directory (and requires \code{BPCells} to be installed).
+#'
+#' @keywords internal
+#' @noRd
+.AteraResolveBPCellsDir <- function(bpcells.dir, data.dir) {
+  if (isFALSE(bpcells.dir)) {
+    return(NULL)
+  }
+  if (is.null(bpcells.dir)) {
+    if (!requireNamespace('BPCells', quietly = TRUE)) {
+      .AteraWarnOnceNoBPCells()
+      return(NULL)
+    }
+    return(.AteraDefaultBPCellsDir(data.dir = data.dir))
+  }
+  return(bpcells.dir)
+}
+
+#' Emit a one-time (per session) message when falling back to in-memory
+#' matrices because BPCells isn't installed
+#'
+#' @keywords internal
+#' @noRd
+.AteraWarnOnceNoBPCells <- function() {
+  opt <- 'Seurat.atera.warned_no_bpcells'
+  if (!isTRUE(getOption(opt))) {
+    message(
+      "Package 'BPCells' is not installed; loading Atera counts matrices ",
+      "in-memory instead of on-disk. Install 'BPCells' for lazy, on-disk-",
+      "backed loading (recommended for large bundles), or pass ",
+      "`bpcells.dir = FALSE` to silence this message and always load in-",
+      "memory."
+    )
+    options(structure(list(TRUE), names = opt))
+  }
+}
+
+#' Read the Atera counts matrix (\code{csc_cell_feature_matrix.zarr.zip}),
+#' optionally restricted to a subset of feature types and optionally backed
+#' by an on-disk \code{BPCells} cache.
+#'
+#' \code{var/feature_type} is row-contiguous in this file (each feature type
+#' occupies one contiguous run of rows), so requested feature types are
+#' translated into a small number of contiguous row-ranges; those are in turn
+#' translated (via a full, but trivially small, read of \code{X/indptr}) into
+#' nnz element-ranges, and only those \code{X/data}/\code{X/indices} chunks
+#' are decoded via \code{.AteraReadArray}'s \code{row.range} chunk-skipping.
+#'
+#' When \code{bpcells.dir} is set and every requested feature type already has
+#' a cache directory under it, the zarr file is not read at all beyond the
+#' (tiny) \code{var/feature_type} column needed to validate the requested
+#' feature type names.
+#'
+#' @return A named list of matrices (one per feature type), each either a
+#' \link[Matrix:dgCMatrix-class]{sparse matrix} or, when cached/written via
+#' \code{bpcells.dir}, a \code{BPCells} \code{IterableMatrix}.
+#'
+#' @keywords internal
+#' @noRd
+.AteraReadCountsMatrix <- function(data.dir, feature.types = NULL, bpcells.dir = NULL) {
+  zip.file <- file.path(data.dir, "csc_cell_feature_matrix.zarr.zip")
+  zidx <- .AteraZipIndex(zip.file)
+  con <- file(zip.file, "rb")
+  on.exit(close(con), add = TRUE)
+
+  ft.factor <- .AteraReadCategorical(con, zidx, "var/feature_type")
+  ft.chr <- as.character(ft.factor)
+  rl <- rle(ft.chr)
+  ends <- cumsum(rl$lengths)
+  starts <- ends - rl$lengths + 1L
+
+  all.types <- rl$values
+  if (is.null(feature.types)) {
+    target.types <- all.types
+  } else {
+    unknown <- setdiff(feature.types, all.types)
+    if (length(unknown) > 0L) {
+      stop("Unknown Atera feature type(s): ", paste(unknown, collapse = ', '), call. = FALSE)
+    }
+    target.types <- feature.types
+  }
+
+  result <- vector(mode = 'list', length = length(target.types))
+  names(result) <- target.types
+  need.build <- character(0)
+  for (ft in target.types) {
+    cache.path <- if (!is.null(bpcells.dir)) file.path(bpcells.dir, .AteraSanitizeName(ft)) else NULL
+    if (!is.null(cache.path) && dir.exists(cache.path)) {
+      .AteraCheckBPCellsDeps()
+      result[[ft]] <- BPCells::open_matrix_dir(dir = cache.path)
+    } else {
+      need.build <- c(need.build, ft)
+    }
+  }
+  if (length(need.build) == 0L) {
+    return(result)
+  }
+
+  var <- .AteraReadFlatGroup(con, zidx, "var", columns = c("feature_name", "feature_type"))
+  obs <- .AteraReadFlatGroup(con, zidx, "obs", columns = "cell_id")
+  cell.ids <- .AteraFormatId(.AteraDecodePackedId(obs$cell_id))
+
+  x.indptr <- .AteraReadArray(con, zidx, "X/indptr")
+
+  requested.runs <- which(rl$values %in% need.build)
+  block.id <- cumsum(c(TRUE, diff(requested.runs) != 1L))
+  blocks <- split(requested.runs, block.id)
+
+  data.parts <- indices.parts <- p.parts <- list()
+  running <- 0L
+  row.idx <- integer(0)
+  for (blk in blocks) {
+    r1 <- starts[blk[1L]]
+    r2 <- ends[blk[length(blk)]]
+    nnz.start <- x.indptr[r1] + 1L
+    nnz.end <- x.indptr[r2 + 1L]
+    if (nnz.end >= nnz.start) {
+      d <- .AteraReadArray(con, zidx, "X/data", row.range = c(nnz.start, nnz.end))
+      i <- .AteraReadArray(con, zidx, "X/indices", row.range = c(nnz.start, nnz.end))
+    } else {
+      d <- numeric(0)
+      i <- numeric(0)
+    }
+    data.parts[[length(data.parts) + 1L]] <- d
+    indices.parts[[length(indices.parts) + 1L]] <- i
+    lp <- x.indptr[r1:(r2 + 1L)] - x.indptr[r1]
+    p.parts[[length(p.parts) + 1L]] <- if (length(p.parts) == 0L) lp else (lp + running)[-1L]
+    running <- running + length(d)
+    row.idx <- c(row.idx, r1:r2)
+  }
+
+  var.sub <- var[row.idx, , drop = FALSE]
+  mtx <- new(
+    Class = "dgRMatrix",
+    j = as.integer(unlist(indices.parts)),
+    p = as.integer(unlist(p.parts)),
+    x = as.double(unlist(data.parts)),
+    Dim = c(nrow(var.sub), length(cell.ids))
+  )
+  mtx <- as(mtx, "CsparseMatrix")
+  rownames(mtx) <- var.sub$feature_name
+  colnames(mtx) <- cell.ids
+
+  for (ft in need.build) {
+    sub <- mtx[var.sub$feature_type == ft, , drop = FALSE]
+    if (!is.null(bpcells.dir)) {
+      .AteraCheckBPCellsDeps()
+      cache.path <- file.path(bpcells.dir, .AteraSanitizeName(ft))
+      dir.create(bpcells.dir, showWarnings = FALSE, recursive = TRUE)
+      BPCells::write_matrix_dir(mat = sub, dir = cache.path)
+      sub <- BPCells::open_matrix_dir(dir = cache.path)
+    }
+    result[[ft]] <- sub
+  }
+  return(result)
+}
+
 #' Load Atera spatial data
 #'
 #' Read the output of \href{https://www.10xgenomics.com}{10x Genomics} Atera,
@@ -3510,6 +3704,26 @@ ReadXenium <- function(
 #' of the full transcript table; this avoids materializing all rows when
 #' only a handful of genes are needed. Ignored when \code{"microns"} is not
 #' in \code{outs}.
+#' @param feature.types Optional character vector of feature types (eg
+#' \dQuote{Gene Expression}) to restrict \dQuote{matrix} to. When set, only
+#' the (contiguous) rows for the requested feature type(s) are
+#' read/decompressed instead of the full counts matrix. Defaults to
+#' \code{NULL}, which reads all feature types (current/default behavior).
+#' Ignored when \code{"matrix"} is not in \code{outs}.
+#' @param bpcells.dir Path to a directory used to cache the counts matrix on
+#' disk, one subdirectory per feature type, via
+#' \link[BPCells:write_matrix_dir]{BPCells}. When set, a feature type already
+#' cached under this directory is opened directly with
+#' \link[BPCells:open_matrix_dir]{BPCells::open_matrix_dir} (no zarr read at
+#' all); a feature type not yet cached is read as usual and then written to
+#' this directory for reuse by later calls. Defaults to \code{NULL}, which
+#' auto-selects a session-scoped cache directory under \code{tempdir()} (so
+#' matrices are BPCells-backed, on-disk, and lazy by default, even for small
+#' bundles) if the \code{BPCells} package is installed, or falls back to
+#' in-memory sparse matrices (with a one-time message) if it isn't. Pass
+#' \code{FALSE} to explicitly opt out and always return in-memory sparse
+#' matrices, without requiring \code{BPCells} at all. Ignored when
+#' \code{"matrix"} is not in \code{outs}.
 #'
 #' @return \code{ReadAtera}: A list with some combination of the following
 #' values:
@@ -3534,7 +3748,9 @@ ReadAtera <- function(
   data.dir,
   outs = c("matrix", "centroids"),
   mols.qv.threshold = 20,
-  genes = NULL
+  genes = NULL,
+  feature.types = NULL,
+  bpcells.dir = NULL
 ) {
   outs <- match.arg(
     arg = outs,
@@ -3551,37 +3767,19 @@ ReadAtera <- function(
         pmtx <- progressor()
         pmtx(message = 'Reading counts matrix', class = 'sticky', amount = 0)
 
-        zip.file <- file.path(data.dir, "csc_cell_feature_matrix.zarr.zip")
-        zidx <- .AteraZipIndex(zip.file)
-        con <- file(zip.file, "rb")
-        on.exit(close(con), add = TRUE)
-
-        obs <- .AteraReadFlatGroup(con, zidx, "obs", columns = "cell_id")
-        var <- .AteraReadFlatGroup(con, zidx, "var", columns = c("feature_name", "feature_type"))
-
-        x.data <- .AteraReadArray(con, zidx, "X/data")
-        x.indices <- .AteraReadArray(con, zidx, "X/indices")
-        x.indptr <- .AteraReadArray(con, zidx, "X/indptr")
-
-        mtx <- new(
-          Class = "dgRMatrix",
-          j = as.integer(x.indices),
-          p = as.integer(x.indptr),
-          x = as.double(x.data),
-          Dim = c(nrow(var), nrow(obs))
+        bpcells.dir <- .AteraResolveBPCellsDir(bpcells.dir = bpcells.dir, data.dir = data.dir)
+        if (!is.null(bpcells.dir)) {
+          .AteraCheckBPCellsDeps()
+        }
+        result <- .AteraReadCountsMatrix(
+          data.dir = data.dir,
+          feature.types = feature.types,
+          bpcells.dir = bpcells.dir
         )
-        mtx <- as(mtx, "CsparseMatrix")
-        rownames(mtx) <- var$feature_name
-        colnames(mtx) <- .AteraFormatId(.AteraDecodePackedId(obs$cell_id))
 
         pmtx(type = "finish")
 
-        sapply(
-          X = intersect(levels(var$feature_type), unique(as.character(var$feature_type))),
-          FUN = function(ft) mtx[var$feature_type == ft, , drop = FALSE],
-          simplify = FALSE,
-          USE.NAMES = TRUE
-        )
+        result
       },
       'centroids' = {
         pcents <- progressor()
