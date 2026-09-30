@@ -3428,12 +3428,19 @@ ReadXenium <- function(
 #' 0-based row index -- not assumed to be in the same row order as any
 #' other file
 #'
+#' Every polygon's last stored vertex is a closing duplicate of its first
+#' vertex (\code{x} always matches exactly), and in the majority of polygons
+#' that duplicate's \code{y} is corrupted to exactly \code{0} in Atera's own
+#' \code{vertices} array. Since consumers (eg \code{geom_polygon}, \code{sf})
+#' already close rings back to the first vertex, that last vertex is dropped
+#' here rather than propagating the corrupted coordinate.
+#'
 #' @keywords internal
 #' @noRd
 .AteraReadPolygonSet <- function(con, zidx, set.idx, cell.id) {
   base <- paste0("polygon_sets/", set.idx)
   cell_index <- .AteraReadArray(con, zidx, paste0(base, "/cell_index"))
-  num_vertices <- .AteraReadArray(con, zidx, paste0(base, "/num_vertices"))
+  num_vertices <- .AteraReadArray(con, zidx, paste0(base, "/num_vertices")) - 1L
   vertices <- .AteraReadArray(con, zidx, paste0(base, "/vertices"))
 
   n <- nrow(vertices)
@@ -3536,6 +3543,253 @@ ReadXenium <- function(
   }
   df$qv <- NULL
   df
+}
+
+#' Check that the \code{RBioFormats} package is installed; only called when
+#' a morphology image is actually requested. The morphology OME-TIFFs are
+#' pyramidal and JPEG2000-compressed, which the base \code{tiff} package
+#' cannot reliably decode (it reports an "unknown" compression type and
+#' cannot enumerate pyramid levels); \code{RBioFormats} wraps the Bio-Formats
+#' Java library, which handles them correctly.
+#'
+#' @keywords internal
+#' @noRd
+.AteraCheckMorphologyDeps <- function() {
+  if (!requireNamespace('RBioFormats', quietly = TRUE)) {
+    stop(
+      "Reading Atera morphology images requires the 'RBioFormats' package. ",
+      "Install it with BiocManager::install('RBioFormats')",
+      call. = FALSE
+    )
+  }
+}
+
+#' List the per-channel morphology OME-TIFF files in a
+#' \dQuote{morphology_2d}/\dQuote{morphology_3d} directory, excluding macOS
+#' resource-fork files (\code{._*})
+#'
+#' @keywords internal
+#' @noRd
+.AteraMorphologyFiles <- function(data.dir, three.d = FALSE) {
+  dir <- file.path(data.dir, if (isTRUE(three.d)) "morphology_3d" else "morphology_2d")
+  if (!dir.exists(dir)) {
+    stop("No ", basename(dir), " directory found at ", dir, call. = FALSE)
+  }
+  files <- list.files(dir, pattern = "\\.ome\\.tif+$", full.names = TRUE)
+  files <- files[!grepl("^\\._", basename(files))]
+  if (!length(files)) {
+    stop("No morphology OME-TIFF files found in ", dir, call. = FALSE)
+  }
+  files
+}
+
+#' Parse the 0-based channel index out of a \dQuote{chNNNN_<name>.ome.tif}
+#' morphology image filename. Each file is itself a multi-page OME-TIFF
+#' containing every channel of the panel, but only the page at this index
+#' holds that channel's real image data (the rest are placeholders) -- see
+#' \code{.AteraReadMorphologyImage}
+#'
+#' @keywords internal
+#' @noRd
+.AteraMorphologyChannelIndex <- function(filename) {
+  m <- regmatches(basename(filename), regexec("^ch(\\d+)_.+\\.ome\\.tif+$", basename(filename)))[[1]]
+  if (length(m) != 2) {
+    stop(
+      "Expected a morphology image filename of the form 'chNNNN_<name>.ome.tif', found ",
+      basename(filename),
+      call. = FALSE
+    )
+  }
+  as.integer(m[2])
+}
+
+#' Parse the channel name out of a \dQuote{chNNNN_<name>.ome.tif} morphology
+#' image filename
+#'
+#' @keywords internal
+#' @noRd
+.AteraMorphologyChannelName <- function(filename) {
+  m <- regmatches(basename(filename), regexec("^ch\\d+_(.+)\\.ome\\.tif+$", basename(filename)))[[1]]
+  if (length(m) != 2) {
+    stop(
+      "Expected a morphology image filename of the form 'chNNNN_<name>.ome.tif', found ",
+      basename(filename),
+      call. = FALSE
+    )
+  }
+  m[2]
+}
+
+#' Build a cheap, reusable handle onto a channel's Atera morphology
+#' OME-TIFF: resolves the matching file, its real-data channel index, and
+#' per-resolution-level pixel dimensions/pixel size up front, but reads no
+#' pixel data. Used to defer the expensive part (decoding image tiles) until
+#' a specific region is actually requested via
+#' \code{.AteraReadMorphologyRegion}, the same handle/fetch split already
+#' used for transcripts by \code{.AteraMoleculesHandle}/
+#' \code{.AteraFetchMolecules}.
+#'
+#' @keywords internal
+#' @noRd
+.AteraMorphologyHandle <- function(data.dir, channel = "dapi") {
+  .AteraCheckMorphologyDeps()
+
+  files <- .AteraMorphologyFiles(data.dir)
+  names(files) <- vapply(files, .AteraMorphologyChannelName, character(1L))
+
+  file <- if (is.numeric(channel)) {
+    indices <- vapply(files, .AteraMorphologyChannelIndex, integer(1L))
+    hits <- files[indices == as.integer(channel)]
+    if (!length(hits)) {
+      stop("No morphology image found for channel index ", channel, call. = FALSE)
+    }
+    hits[[1]]
+  } else {
+    hits <- names(files)[grepl(channel, names(files), ignore.case = TRUE)]
+    if (!length(hits)) {
+      stop(
+        "No morphology image found matching channel '", channel, "'; available channels: ",
+        paste(names(files), collapse = ", "),
+        call. = FALSE
+      )
+    }
+    files[[hits[1]]]
+  }
+
+  md <- RBioFormats::read.metadata(file)
+  n.levels <- RBioFormats::seriesCount(md)
+  cm <- RBioFormats::coreMetadata(md)
+  dims <- lapply(cm, function(x) c(x = x$sizeX, y = x$sizeY))
+
+  specs.file <- file.path(data.dir, "experiment.spatial")
+  pixel.size.full <- if (file.exists(specs.file) && requireNamespace('jsonlite', quietly = TRUE)) {
+    jsonlite::read_json(specs.file)$pixel_size
+  } else {
+    NA_real_
+  }
+
+  structure(
+    list(
+      file = file,
+      channel = .AteraMorphologyChannelName(file),
+      channel.index = .AteraMorphologyChannelIndex(file),
+      n.resolutions = n.levels,
+      dim = dims,
+      pixel.size.full = pixel.size.full
+    ),
+    class = "AteraMorphologyHandle"
+  )
+}
+
+#' Convert a \code{region} (a list with optional \code{x}/\code{y} elements,
+#' each a length-2 micron range) into 1-based pixel index ranges at a given
+#' \code{.AteraMorphologyHandle}'s resolution \code{level}, clamped to the
+#' plane's extent on that axis. A missing/\code{NULL} \code{region}, or a
+#' missing \code{x}/\code{y} element, reads the whole plane along that axis.
+#'
+#' @keywords internal
+#' @noRd
+.AteraMorphologyRegionToPixels <- function(handle, level, region, pixel.size) {
+  d <- handle$dim[[level]]
+  to.pixels <- function(um.range, size) {
+    if (is.null(um.range)) {
+      return(NULL)
+    }
+    if (is.na(pixel.size)) {
+      stop(
+        "Cannot convert 'morphology.region' from microns to pixels: pixel size unavailable ",
+        "(no 'experiment.spatial' file found)",
+        call. = FALSE
+      )
+    }
+    px <- round(um.range / pixel.size) + 1L
+    px <- pmax(1L, pmin(size, px))
+    px[1]:px[2]
+  }
+  list(
+    x = to.pixels(region$x, d["x"]),
+    y = to.pixels(region$y, d["y"])
+  )
+}
+
+#' Read a (optionally cropped) single channel plane from an
+#' \code{.AteraMorphologyHandle} at a given pyramid resolution level, by
+#' default the lowest-resolution (smallest) level, which is normally all
+#' that is needed for overview plots.
+#'
+#' \code{x.range}/\code{y.range} (1-based pixel indices at \code{resolution})
+#' restrict the read to a rectangular window via
+#' \code{RBioFormats::read.image}'s \code{subset} argument, which decodes
+#' only the on-disk tiles overlapping that window rather than materializing
+#' the whole plane -- needed because a full-resolution plane of these
+#' whole-slide images can be tens of thousands of pixels per side (large
+#' enough that reading it whole can exceed available Java heap memory).
+#' Resolution levels are exposed by \code{RBioFormats} as separate
+#' \dQuote{series} (\code{resolution} argument) of a single real image
+#' series (\code{series = 1}), not as true multi-series data.
+#'
+#' @return A list with elements \code{image} (a numeric matrix, indexed
+#' \verb{[x, y]} in the same top-left-origin pixel convention as the OME-TIFF
+#' and, after scaling by \code{pixel.size} and offsetting by \code{origin},
+#' the same convention as \code{ReadAtera}'s \code{centroids}/\code{microns}
+#' micron coordinates -- no axis flip is needed), \code{channel} (the
+#' matched channel name), \code{resolution} (the pyramid level read, 1 =
+#' full resolution), \code{n.resolutions} (the number of pyramid levels
+#' available), \code{pixel.size} (microns per pixel of \code{image}, i.e.
+#' already scaled for the resolution level read; \code{NA} if
+#' \code{experiment.spatial} could not be read), and \code{origin} (the
+#' micron coordinates, \code{c(x=, y=)}, of \code{image}'s \verb{[1, 1]}
+#' pixel -- \code{c(x=0, y=0)} unless \code{x.range}/\code{y.range} crop out
+#' the top-left corner of the full plane)
+#'
+#' @keywords internal
+#' @noRd
+.AteraReadMorphologyRegion <- function(handle, resolution = NULL, x.range = NULL, y.range = NULL) {
+  level <- resolution %||% handle$n.resolutions
+  d <- handle$dim[[level]]
+  downsample <- 2 ^ (level - 1L)
+  pixel.size <- if (is.na(handle$pixel.size.full)) NA_real_ else handle$pixel.size.full * downsample
+
+  x.range <- x.range %||% seq_len(d["x"])
+  y.range <- y.range %||% seq_len(d["y"])
+
+  img <- RBioFormats::read.image(
+    handle$file, series = 1L, resolution = level, normalize = FALSE,
+    subset = list(x = x.range, y = y.range, c = handle$channel.index + 1L)
+  )
+  ## requesting a single channel via 'subset' already drops the channel
+  ## dimension (2D result); only index it away if it's still present (3D)
+  if (length(dim(img)) == 3L) {
+    img <- img[, , 1L]
+  }
+
+  list(
+    image = img,
+    channel = handle$channel,
+    resolution = level,
+    n.resolutions = handle$n.resolutions,
+    pixel.size = pixel.size,
+    origin = c(x = (x.range[1] - 1L), y = (y.range[1] - 1L)) * (if (is.na(pixel.size)) NA_real_ else pixel.size)
+  )
+}
+
+#' Read a single channel plane of an Atera morphology image, optionally
+#' cropped to \code{region} (a list with \code{x}/\code{y} elements, each a
+#' length-2 micron range; \code{NULL}, the default, reads the whole plane).
+#' A thin convenience wrapper around \code{.AteraMorphologyHandle} +
+#' \code{.AteraReadMorphologyRegion} for the common one-shot case (see those
+#' for details/return value).
+#'
+#' @keywords internal
+#' @noRd
+.AteraReadMorphologyImage <- function(data.dir, channel = "dapi", resolution = NULL, region = NULL) {
+  handle <- .AteraMorphologyHandle(data.dir = data.dir, channel = channel)
+  level <- resolution %||% handle$n.resolutions
+  downsample <- 2 ^ (level - 1L)
+  pixel.size <- if (is.na(handle$pixel.size.full)) NA_real_ else handle$pixel.size.full * downsample
+
+  px.region <- .AteraMorphologyRegionToPixels(handle, level, region, pixel.size)
+  .AteraReadMorphologyRegion(handle, resolution = level, x.range = px.region$x, y.range = px.region$y)
 }
 
 #' Turn a feature type name (eg \dQuote{Negative Control Probe}) into a
@@ -3754,10 +4008,35 @@ ReadXenium <- function(
 #'  than one nucleus polygon
 #'  \item \dQuote{microns}: transcript molecule coordinates. This is
 #'  optional as transcripts files can be very large.
+#'  \item \dQuote{morphology}: a single channel plane of a
+#'  \dQuote{morphology_2d} image (eg the DAPI stain), by default at the
+#'  lowest-resolution pyramid level, for use as a background/overview image.
+#'  Requires the \code{RBioFormats} package, since these images are
+#'  pyramidal, JPEG2000-compressed OME-TIFFs that the base \code{tiff}
+#'  package cannot reliably decode.
 #' }
 #' @param mols.qv.threshold Remove transcript molecules with a calibrated
 #' Q-score less than this threshold when reading \dQuote{microns}. Set to
 #' \code{NULL} to disable filtering.
+#' @param morphology.channel Channel to read when \dQuote{morphology} is in
+#' \code{outs}: either a channel name (matched case-insensitively as a
+#' substring, eg \dQuote{dapi}) or a 0-based integer channel index (matching
+#' the \dQuote{chNNNN} prefix of the image filename).
+#' @param morphology.resolution Pyramid resolution level to read when
+#' \dQuote{morphology} is in \code{outs}, where \code{1} is full resolution
+#' and each subsequent level halves both dimensions. Defaults to \code{NULL},
+#' which reads the lowest-resolution (smallest, fastest) level available --
+#' normally all that's needed for an overview plot.
+#' @param morphology.region Optional list with \code{x}/\code{y} elements
+#' (each a length-2 micron range, in the same coordinate space as
+#' \dQuote{centroids}/\dQuote{microns}/segmentations), used to crop
+#' \dQuote{morphology} to a rectangular window instead of reading the whole
+#' plane. Only the on-disk tiles overlapping that window are decoded, so
+#' this is the recommended way to read a region at \code{morphology.resolution
+#' = 1} (full resolution): reading a full-resolution plane in its entirety
+#' can exceed available memory for these whole-slide images, since they can
+#' be tens of thousands of pixels per side. Defaults to \code{NULL}, which
+#' reads the whole plane.
 #' @param genes Optional character vector of gene names to restrict
 #' \dQuote{microns} to. When set, only the chunks spanning each requested
 #' gene's (gene-sorted, contiguous) row range are read/decompressed instead
@@ -3799,6 +4078,16 @@ ReadXenium <- function(
 #'  \dQuote{cell}, \dQuote{x}, and \dQuote{y}
 #'  \item \dQuote{\code{microns}}: a data frame with transcript coordinates
 #'  in three columns: \dQuote{x}, \dQuote{y}, and \dQuote{gene}
+#'  \item \dQuote{\code{morphology}}: a list with elements \code{image} (a
+#'  numeric matrix, indexed \verb{[x, y]}, in the same top-left-origin pixel
+#'  convention as \dQuote{centroids}/\dQuote{microns}' micron coordinates --
+#'  no axis flip is needed), \code{channel}, \code{resolution},
+#'  \code{n.resolutions}, \code{pixel.size} (microns per pixel of
+#'  \code{image}), and \code{origin} (the micron coordinates,
+#'  \code{c(x=, y=)}, of \code{image}'s \verb{[1, 1]} pixel -- \code{c(x=0,
+#'  y=0)} unless \code{morphology.region} crops out the top-left corner of
+#'  the full plane); see
+#'  \code{morphology.channel}/\code{morphology.resolution}/\code{morphology.region}
 #' }
 #'
 #' @export
@@ -3810,11 +4099,14 @@ ReadAtera <- function(
   mols.qv.threshold = 20,
   genes = NULL,
   feature.types = NULL,
-  bpcells.dir = NULL
+  bpcells.dir = NULL,
+  morphology.channel = "dapi",
+  morphology.resolution = NULL,
+  morphology.region = NULL
 ) {
   outs <- match.arg(
     arg = outs,
-    choices = c("matrix", "centroids", "segmentations", "nucleus_segmentations", "microns"),
+    choices = c("matrix", "centroids", "segmentations", "nucleus_segmentations", "microns", "morphology"),
     several.ok = TRUE
   )
 
@@ -3893,6 +4185,21 @@ ReadAtera <- function(
         pmicrons(type = 'finish')
 
         df
+      },
+      'morphology' = {
+        pmorph <- progressor()
+        pmorph(message = 'Loading morphology image', class = 'sticky', amount = 0)
+
+        result <- .AteraReadMorphologyImage(
+          data.dir = data.dir,
+          channel = morphology.channel,
+          resolution = morphology.resolution,
+          region = morphology.region
+        )
+
+        pmorph(type = 'finish')
+
+        result
       },
       stop("Unknown Atera input type: ", otype)
     )
