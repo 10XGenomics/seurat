@@ -119,6 +119,7 @@ Suggests:
     presto,
     rsvd,
     R.utils,
+    RBioFormats,
     Rfast2,
     rtracklayer,
     S4Vectors,

@@ -311,6 +311,27 @@ LoadXenium <- function(
 #' and lazy by default (even for small bundles) whenever \code{BPCells} is
 #' installed; pass \code{FALSE} to always get plain in-memory matrices
 #' instead. See \code{\link{ReadAtera}}
+#' @param morphology.image Whether to load a single channel plane of a
+#' \dQuote{morphology_2d} image (eg the DAPI stain), by default at the
+#' lowest-resolution pyramid level, for use as a background/overview image
+#' in plots. Requires the \code{RBioFormats} package. Defaults to
+#' \code{FALSE} since it is an optional dependency and not needed for
+#' downstream analysis. See \code{\link{ReadAtera}}
+#' @param morphology.channel Channel to load when \code{morphology.image =
+#' TRUE}: either a channel name (matched case-insensitively as a substring,
+#' eg \dQuote{dapi}) or a 0-based integer channel index. See
+#' \code{\link{ReadAtera}}
+#' @param morphology.resolution Pyramid resolution level to load when
+#' \code{morphology.image = TRUE}, where \code{1} is full resolution.
+#' Defaults to \code{NULL}, which loads the lowest-resolution (smallest,
+#' fastest) level available. See \code{\link{ReadAtera}}
+#' @param morphology.region Optional list with \code{x}/\code{y} elements
+#' (each a length-2 micron range) to crop the loaded morphology image to a
+#' rectangular window instead of reading the whole plane; recommended when
+#' using \code{morphology.resolution = 1} (full resolution) on real-world
+#' datasets, since these whole-slide images can be tens of thousands of
+#' pixels per side. Defaults to \code{NULL}, which reads the whole plane.
+#' See \code{\link{ReadAtera}}
 #'
 #' @importFrom SeuratObject Cells CreateCentroids CreateFOV CreateSegmentation
 #' CreateSeuratObject CreateAssay5Object CreateMolecules
@@ -329,7 +350,11 @@ LoadAtera <- function(
   segmentations = NULL,
   genes = NULL,
   feature.types = NULL,
-  bpcells.dir = NULL
+  bpcells.dir = NULL,
+  morphology.image = FALSE,
+  morphology.channel = "dapi",
+  morphology.resolution = NULL,
+  morphology.region = NULL
 ) {
   if (!is.null(segmentations) && !(segmentations %in% c('nucleus', 'cell'))) {
     stop('segmentations must be NULL or one of "nucleus", "cell"')
@@ -345,12 +370,15 @@ LoadAtera <- function(
 
   data <- ReadAtera(
     data.dir = data.dir,
-    outs = c("matrix", "centroids", "segmentations", "nucleus_segmentations")[
-      c(TRUE, cell.centroids, isTRUE(segmentations == 'cell'), isTRUE(segmentations == 'nucleus'))
+    outs = c("matrix", "centroids", "segmentations", "nucleus_segmentations", "morphology")[
+      c(TRUE, cell.centroids, isTRUE(segmentations == 'cell'), isTRUE(segmentations == 'nucleus'), morphology.image)
     ],
     mols.qv.threshold = mols.qv.threshold,
     feature.types = feature.types,
-    bpcells.dir = bpcells.dir
+    bpcells.dir = bpcells.dir,
+    morphology.channel = morphology.channel,
+    morphology.resolution = morphology.resolution,
+    morphology.region = morphology.region
   )
   mols.handle <- NULL
   if (molecule.coordinates) {
@@ -419,6 +447,10 @@ LoadAtera <- function(
 
   if (!is.null(mols.handle)) {
     Misc(atera.obj, 'atera.molecules') <- list(handle = mols.handle, cache = data$microns, fov = fov)
+  }
+
+  if (!is.null(data$morphology)) {
+    Misc(atera.obj, 'atera.morphology') <- data$morphology
   }
 
   return(atera.obj)

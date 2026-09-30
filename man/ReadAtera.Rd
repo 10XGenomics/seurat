@@ -15,7 +15,11 @@ LoadAtera(
   segmentations = NULL,
   genes = NULL,
   feature.types = NULL,
-  bpcells.dir = NULL
+  bpcells.dir = NULL,
+  morphology.image = FALSE,
+  morphology.channel = "dapi",
+  morphology.resolution = NULL,
+  morphology.region = NULL
 )
 
 ReadAtera(
@@ -24,7 +28,10 @@ ReadAtera(
   mols.qv.threshold = 20,
   genes = NULL,
   feature.types = NULL,
-  bpcells.dir = NULL
+  bpcells.dir = NULL,
+  morphology.channel = "dapi",
+  morphology.resolution = NULL,
+  morphology.region = NULL
 )
 }
 \arguments{
@@ -76,6 +83,35 @@ in-memory sparse matrices (with a one-time message) if it isn't. Pass
 matrices, without requiring \code{BPCells} at all. Ignored when
 \code{"matrix"} is not in \code{outs}.}
 
+\item{morphology.image}{Whether to load a single channel plane of a
+\dQuote{morphology_2d} image (eg the DAPI stain), by default at the
+lowest-resolution pyramid level, for use as a background/overview image
+in plots. Requires the \code{RBioFormats} package. Defaults to
+\code{FALSE} since it is an optional dependency and not needed for
+downstream analysis. See \code{\link{ReadAtera}}}
+
+\item{morphology.channel}{Channel to read when \dQuote{morphology} is in
+\code{outs}: either a channel name (matched case-insensitively as a
+substring, eg \dQuote{dapi}) or a 0-based integer channel index (matching
+the \dQuote{chNNNN} prefix of the image filename).}
+
+\item{morphology.resolution}{Pyramid resolution level to read when
+\dQuote{morphology} is in \code{outs}, where \code{1} is full resolution
+and each subsequent level halves both dimensions. Defaults to \code{NULL},
+which reads the lowest-resolution (smallest, fastest) level available --
+normally all that's needed for an overview plot.}
+
+\item{morphology.region}{Optional list with \code{x}/\code{y} elements
+(each a length-2 micron range, in the same coordinate space as
+\dQuote{centroids}/\dQuote{microns}/segmentations), used to crop
+\dQuote{morphology} to a rectangular window instead of reading the whole
+plane. Only the on-disk tiles overlapping that window are decoded, so
+this is the recommended way to read a region at \code{morphology.resolution
+= 1} (full resolution): reading a full-resolution plane in its entirety
+can exceed available memory for these whole-slide images, since they can
+be tens of thousands of pixels per side. Defaults to \code{NULL}, which
+reads the whole plane.}
+
 \item{outs}{Types of outputs to read; choose one or more of:
 \itemize{
  \item \dQuote{matrix}: the counts matrix
@@ -87,6 +123,12 @@ matrices, without requiring \code{BPCells} at all. Ignored when
  than one nucleus polygon
  \item \dQuote{microns}: transcript molecule coordinates. This is
  optional as transcripts files can be very large.
+ \item \dQuote{morphology}: a single channel plane of a
+ \dQuote{morphology_2d} image (eg the DAPI stain), by default at the
+ lowest-resolution pyramid level, for use as a background/overview image.
+ Requires the \code{RBioFormats} package, since these images are
+ pyramidal, JPEG2000-compressed OME-TIFFs that the base \code{tiff}
+ package cannot reliably decode.
 }}
 }
 \value{
@@ -106,6 +148,16 @@ values:
  \dQuote{cell}, \dQuote{x}, and \dQuote{y}
  \item \dQuote{\code{microns}}: a data frame with transcript coordinates
  in three columns: \dQuote{x}, \dQuote{y}, and \dQuote{gene}
+ \item \dQuote{\code{morphology}}: a list with elements \code{image} (a
+ numeric matrix, indexed \verb{[x, y]}, in the same top-left-origin pixel
+ convention as \dQuote{centroids}/\dQuote{microns}' micron coordinates --
+ no axis flip is needed), \code{channel}, \code{resolution},
+ \code{n.resolutions}, \code{pixel.size} (microns per pixel of
+ \code{image}), and \code{origin} (the micron coordinates,
+ \code{c(x=, y=)}, of \code{image}'s \verb{[1, 1]} pixel -- \code{c(x=0,
+ y=0)} unless \code{morphology.region} crops out the top-left corner of
+ the full plane); see
+ \code{morphology.channel}/\code{morphology.resolution}/\code{morphology.region}
 }
 }
 \description{
