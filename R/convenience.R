@@ -428,22 +428,31 @@ LoadAtera <- function(
     Misc(atera.obj, 'run_metadata') <- data$metadata
   }
 
-  for (name in intersect(names(slot.map), names(data$matrix))) {
-    mtx <- data$matrix[[name]]
-    # CreateAssay5Object errors on single-feature layers ("Layers must be
-    # two-dimensional objects"); Assay (v3) handles this edge case fine, and
-    # the laziness benefit of Assay5/BPCells is negligible for a single row.
-    atera.obj[[slot.map[name]]] <- if (nrow(mtx) == 1L) {
-      CreateAssayObject(counts = mtx)
-    } else {
-      CreateAssay5Object(counts = mtx)
-    }
+  extra.types <- intersect(names(slot.map), names(data$matrix))
+  single.feature.types <- Filter(function(name) nrow(data$matrix[[name]]) == 1L, extra.types)
+  for (name in setdiff(extra.types, single.feature.types)) {
+    atera.obj[[slot.map[name]]] <- CreateAssay5Object(counts = data$matrix[[name]])
   }
 
   atera.obj <- subset(atera.obj, cells = intersect(Cells(atera.obj), Cells(coords)))
   coords <- subset(coords, cells = intersect(Cells(atera.obj), Cells(coords)))
 
   atera.obj[[fov]] <- coords
+
+  for (name in single.feature.types) {
+    # CreateAssay5Object errors on single-feature layers ("Layers must be
+    # two-dimensional objects"), which would otherwise force falling back to
+    # the legacy v3 Assay (CreateAssayObject) here -- but that class's
+    # LayerData.Assay() validates its `cells` argument via
+    # rlang::arg_match(..., multiple = TRUE) every time per-assay stats are
+    # (re)computed (on creation, on every later subset(), etc.), and that
+    # call doesn't scale: it's effectively unusable past a few thousand
+    # cells, let alone the millions typical of a whole-tissue Atera run.
+    # A single-feature "assay" isn't useful for standard per-feature
+    # analysis anyway, so it's stashed as a plain matrix in Misc instead,
+    # subset to the cells actually retained above.
+    Misc(atera.obj, paste0('atera.', slot.map[name])) <- data$matrix[[name]][, Cells(atera.obj), drop = FALSE]
+  }
 
   if (!is.null(mols.handle)) {
     Misc(atera.obj, 'atera.molecules') <- list(handle = mols.handle, cache = data$microns, fov = fov)
@@ -501,6 +510,67 @@ LoadAteraMolecules <- function(object, genes) {
   )
   Misc(object, 'atera.molecules') <- handle.info
 
+  return(object)
+}
+
+#' Add segmentation polygons to an Atera field of view, for only the cells
+#' currently present in it
+#'
+#' \code{LoadAtera(..., segmentations = "cell")} builds a \code{Polygons}
+#' object (via \code{sp::SpatialPolygons()}) for every cell up front, which
+#' doesn't scale to bundles with many hundreds of thousands of cells -- that
+#' machinery gets impractically slow, and can overflow R's protection stack,
+#' well before reaching cell counts typical of a whole-tissue Atera run. This
+#' function instead builds segmentation polygons only for the cells already
+#' present in \code{object[[fov]]}, so a bundle too large to load
+#' segmentations for up front (\code{LoadAtera(..., segmentations = NULL)})
+#' can still get polygons for a \code{\link[SeuratObject]{Crop}}ped
+#' region-of-interest FOV, which typically has orders of magnitude fewer
+#' cells.
+#'
+#' @param object A Seurat object created by \code{\link{LoadAtera}}
+#' @param data.dir The same \code{data.dir} passed to the original
+#' \code{\link{LoadAtera}} call (the Atera output bundle directory)
+#' @param fov Name of the FOV (typically already cropped via
+#' \code{\link[SeuratObject]{Crop}}) to add segmentation polygons to
+#' @param segmentations One of \code{"cell"} or \code{"nucleus"}
+#' @param max.cells Safety limit: errors rather than attempting to build
+#' polygons for more than this many cells, since \code{sp::SpatialPolygons()}
+#' becomes impractically slow/crash-prone well before this many
+#'
+#' @return \code{object}, with a \code{"segmentations"} boundary added to
+#' \code{object[[fov]]}, built only for the cells currently in that FOV
+#'
+#' @importFrom SeuratObject Cells CreateSegmentation
+#'
+#' @export
+#'
+LoadAteraSegmentations <- function(object, data.dir, fov, segmentations = "cell", max.cells = 50000) {
+  if (!isTRUE(segmentations %in% c("cell", "nucleus"))) {
+    stop("segmentations must be one of \"cell\", \"nucleus\"", call. = FALSE)
+  }
+  cell.ids <- Cells(object[[fov]])
+  if (length(cell.ids) > max.cells) {
+    stop(
+      "FOV '", fov, "' has ", length(cell.ids), " cells, over `max.cells` (", max.cells, "). ",
+      "Building per-cell segmentation polygons (via sp::SpatialPolygons()) doesn't scale this ",
+      "far and will be extremely slow or crash. Crop to a smaller region first, or raise ",
+      "`max.cells` if you're sure.",
+      call. = FALSE
+    )
+  }
+
+  zip.file <- file.path(data.dir, "cells.zarr.zip")
+  zidx <- .AteraZipIndex(zip.file)
+  con <- file(zip.file, "rb")
+  on.exit(close(con), add = TRUE)
+
+  all.cell.ids <- .AteraFormatId(.AteraDecodePackedId(.AteraReadArray(con, zidx, "cell_id")))
+  set.idx <- if (segmentations == "cell") 1L else 0L
+  df <- .AteraReadPolygonSet(con, zidx, set.idx, all.cell.ids)
+  df <- df[df$cell %in% cell.ids, , drop = FALSE]
+
+  object[[fov]][["segmentations"]] <- CreateSegmentation(df)
   return(object)
 }
 

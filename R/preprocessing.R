@@ -2975,8 +2975,10 @@ ReadXenium <- function(
   is.zip64 <- n.entries == 0xFFFF || cd.size >= 0xFFFFFFFF || cd.offset >= 0xFFFFFFFF
   if (is.zip64) {
     # the Zip64 EOCD locator is the fixed-size (20 byte) record immediately
-    # preceding the EOCD record we just found
-    locator.abs.pos <- (file.size - tail.size) + pos - 20L
+    # preceding the EOCD record we just found; `pos` is a 1-based index into
+    # tail.bytes, so the 0-based absolute file offset of the signature is
+    # (file.size - tail.size) + pos - 1
+    locator.abs.pos <- (file.size - tail.size) + pos - 21L
     seek(con, where = locator.abs.pos, origin = "start")
     locator <- readBin(con, what = "raw", n = 20L)
     zip64.eocd.offset <- .AteraLeU64(locator, 9L)
@@ -3180,12 +3182,23 @@ ReadXenium <- function(
 .AteraReadArray <- function(con, zidx, array.path, row.range = NULL) {
   meta <- .AteraReadJSON(con, zidx, paste0(array.path, "/.zarray"))
   shape <- meta$shape
-  chunks <- meta$chunks
+  # Coerced to double (chunk sizes parse as plain R integers, unlike `shape`,
+  # which jsonlite already widens to double once it exceeds 32-bit range):
+  # chunk-index * chunk-size products below can exceed 32-bit range for large
+  # arrays (eg a multi-billion-element sparse matrix's X/data), and R's
+  # native integer arithmetic silently overflows to NA rather than promoting
+  # to double, so at least one operand of every such product must be double
+  chunks <- as.double(meta$chunks)
   dtype <- meta$dtype
   order <- if (is.null(meta$order)) "C" else meta$order
   sep <- if (is.null(meta$dimension_separator)) "." else meta$dimension_separator
   fill.value <- if (is.null(meta$fill_value)) 0 else meta$fill_value
   ndim <- length(shape)
+
+  if (ndim == 0L) {
+    raw.chunk <- .AteraReadEntryRaw(con, zidx, paste0(array.path, "/0"))
+    return(if (is.null(raw.chunk)) fill.value else .AteraDecodeChunk(raw.chunk, dtype, 1L))
+  }
 
   # Chunk decoding is split into two phases so no I/O happens inside forked
   # workers: `con` is a single connection shared across this whole call, and
@@ -3208,7 +3221,7 @@ ReadXenium <- function(
     raw.chunks <- lapply(chunk.idx, function(ci) {
       .AteraReadEntryRaw(con, zidx, paste0(array.path, "/", ci))
     })
-    actual.ns <- vapply(chunk.idx, function(ci) min(csize, n - ci * csize), integer(1L))
+    actual.ns <- vapply(chunk.idx, function(ci) min(csize, n - ci * csize), numeric(1L))
     decode <- function(raw.chunk, actual.n) {
       if (is.null(raw.chunk)) rep(fill.value, actual.n) else .AteraDecodeChunk(raw.chunk, dtype, actual.n)
     }
@@ -3659,6 +3672,13 @@ ReadXenium <- function(
   md <- RBioFormats::read.metadata(file)
   n.levels <- RBioFormats::seriesCount(md)
   cm <- RBioFormats::coreMetadata(md)
+  # RBioFormats::coreMetadata() unwraps its usual per-series list and returns
+  # a single series' metadata directly when there's only one series (eg a
+  # non-pyramidal image with no resolution levels), so it must be re-wrapped
+  # to keep the one-element-per-level shape `dims` below expects
+  if (n.levels == 1L) {
+    cm <- list(cm)
+  }
   dims <- lapply(cm, function(x) c(x = x$sizeX, y = x$sizeY))
 
   specs.file <- file.path(data.dir, "experiment.spatial")
@@ -3866,16 +3886,137 @@ ReadXenium <- function(
   }
 }
 
+#' Split a contiguous feature row range \code{r1:r2} into smaller row
+#' sub-ranges, each covering no more than \code{nnz.budget} non-zero matrix
+#' entries (per the running element counts in \code{x.indptr}), so that
+#' \code{.AteraReadCountsMatrix} can decode/build one bounded-size matrix
+#' chunk at a time instead of materializing an entire (potentially
+#' multi-billion-entry) feature type's worth of \code{X/data}/\code{X/indices}
+#' in memory at once. A single row whose own nnz already exceeds
+#' \code{nnz.budget} still gets its own (over-budget) batch, since rows can't
+#' be split further.
+#'
+#' @return A list of length-2 integer vectors \code{c(start, end)}, each a
+#' 1-based, inclusive row sub-range of \code{r1:r2}
+#'
+#' @keywords internal
+#' @noRd
+.AteraNnzRowBatches <- function(x.indptr, r1, r2, nnz.budget) {
+  batches <- list()
+  batch.start <- r1
+  base <- x.indptr[r1]
+  for (i in r1:r2) {
+    if (x.indptr[i + 1L] - base >= nnz.budget) {
+      batches[[length(batches) + 1L]] <- c(batch.start, i)
+      batch.start <- i + 1L
+      base <- x.indptr[i + 1L]
+    }
+  }
+  if (batch.start <= r2) {
+    batches[[length(batches) + 1L]] <- c(batch.start, r2)
+  }
+  batches
+}
+
+#' Decode a single feature (\code{X} row) sub-range \code{sr1:sr2} of the
+#' counts matrix into an in-memory sparse matrix, named/dimensioned
+#' consistently with the full matrix (all cells as columns)
+#'
+#' @keywords internal
+#' @noRd
+.AteraReadRowBlockMatrix <- function(con, zidx, x.indptr, sr1, sr2, var, cell.ids) {
+  nnz.start <- x.indptr[sr1] + 1L
+  nnz.end <- x.indptr[sr2 + 1L]
+  if (nnz.end >= nnz.start) {
+    d <- .AteraReadArray(con, zidx, "X/data", row.range = c(nnz.start, nnz.end))
+    i <- .AteraReadArray(con, zidx, "X/indices", row.range = c(nnz.start, nnz.end))
+  } else {
+    d <- numeric(0)
+    i <- numeric(0)
+  }
+  blk <- new(
+    Class = "dgRMatrix",
+    j = as.integer(i),
+    p = as.integer(x.indptr[sr1:(sr2 + 1L)] - x.indptr[sr1]),
+    x = as.double(d),
+    Dim = c(sr2 - sr1 + 1L, length(cell.ids))
+  )
+  blk <- as(blk, "CsparseMatrix")
+  rownames(blk) <- var$feature_name[sr1:sr2]
+  colnames(blk) <- cell.ids
+  blk
+}
+
+#' Build (and, when \code{bpcells.dir} is set, cache) one feature type's
+#' counts matrix, in bounded-memory row batches (see
+#' \code{.AteraNnzRowBatches}) rather than decoding the whole
+#' \code{r1:r2}/\code{X/data} range at once -- the latter needs tens of GB of
+#' RAM for a multi-billion-entry feature type (eg a whole-transcriptome
+#' panel's "Gene Expression" rows), which doesn't fit on commodity machines.
+#'
+#' Each batch is decoded, (when caching) converted to a \code{BPCells}
+#' \code{uint32_t} matrix and written to its own small temporary on-disk
+#' directory, and then discarded from memory; batches are only ever
+#' recombined (\code{rbind}) as cheap, lazy on-disk/\code{IterableMatrix}
+#' references, and that combined reference is written to \code{cache.path}
+#' (the real, permanent cache directory) \emph{before} the temporary
+#' per-batch directories are cleaned up -- \code{BPCells::write_matrix_dir}'s
+#' own chunked iteration streams through that final write without
+#' re-materializing everything at once. Without \code{bpcells.dir}, batches
+#' are instead recombined in-memory, so peak memory is still bounded by the
+#' full matrix's size (an in-memory result is, by definition, not scalable
+#' beyond available RAM).
+#'
+#' @return A \link[Matrix:dgCMatrix-class]{sparse matrix}, or (when
+#' \code{bpcells.dir} is set) a \code{BPCells} \code{IterableMatrix} opened
+#' from \code{cache.path}
+#'
+#' @keywords internal
+#' @noRd
+.AteraBuildFeatureTypeMatrix <- function(con, zidx, x.indptr, r1, r2, var, cell.ids, bpcells.dir, cache.path, nnz.budget) {
+  row.batches <- .AteraNnzRowBatches(x.indptr, r1, r2, nnz.budget)
+  use.bpcells <- !is.null(bpcells.dir)
+
+  if (!use.bpcells) {
+    parts <- lapply(row.batches, function(b) {
+      .AteraReadRowBlockMatrix(con, zidx, x.indptr, b[1L], b[2L], var, cell.ids)
+    })
+    return(if (length(parts) == 1L) parts[[1L]] else do.call(rbind, parts))
+  }
+
+  .AteraCheckBPCellsDeps()
+  staging.dir <- file.path(bpcells.dir, paste0(".tmp_", .AteraSanitizeName(basename(tempfile()))))
+  dir.create(staging.dir, recursive = TRUE)
+  on.exit(unlink(staging.dir, recursive = TRUE), add = TRUE)
+
+  tmp.dirs <- vapply(seq_along(row.batches), function(k) {
+    b <- row.batches[[k]]
+    blk <- .AteraReadRowBlockMatrix(con, zidx, x.indptr, b[1L], b[2L], var, cell.ids)
+    blk <- BPCells::convert_matrix_type(methods::as(blk, "IterableMatrix"), type = "uint32_t")
+    tmp.dir <- file.path(staging.dir, k)
+    BPCells::write_matrix_dir(mat = blk, dir = tmp.dir)
+    tmp.dir
+  }, character(1L))
+
+  part.mats <- lapply(tmp.dirs, BPCells::open_matrix_dir)
+  combined <- if (length(part.mats) == 1L) part.mats[[1L]] else do.call(rbind, part.mats)
+  BPCells::write_matrix_dir(mat = combined, dir = cache.path)
+  BPCells::open_matrix_dir(dir = cache.path)
+}
+
 #' Read the Atera counts matrix (\code{csc_cell_feature_matrix.zarr.zip}),
 #' optionally restricted to a subset of feature types and optionally backed
 #' by an on-disk \code{BPCells} cache.
 #'
 #' \code{var/feature_type} is row-contiguous in this file (each feature type
-#' occupies one contiguous run of rows), so requested feature types are
-#' translated into a small number of contiguous row-ranges; those are in turn
-#' translated (via a full, but trivially small, read of \code{X/indptr}) into
-#' nnz element-ranges, and only those \code{X/data}/\code{X/indices} chunks
-#' are decoded via \code{.AteraReadArray}'s \code{row.range} chunk-skipping.
+#' occupies one contiguous run of rows), so each requested feature type is
+#' translated into a single contiguous row-range; that is in turn translated
+#' (via a full, but trivially small, read of \code{X/indptr}) into nnz
+#' element-ranges, and only those \code{X/data}/\code{X/indices} chunks are
+#' decoded via \code{.AteraReadArray}'s \code{row.range} chunk-skipping. Each
+#' feature type's row-range is further split into bounded-size row batches
+#' (\code{.AteraBuildFeatureTypeMatrix}) so that building/caching even a
+#' multi-billion-entry feature type stays within a few GB of peak memory.
 #'
 #' When \code{bpcells.dir} is set and every requested feature type already has
 #' a cache directory under it, the zarr file is not read at all beyond the
@@ -3888,7 +4029,7 @@ ReadXenium <- function(
 #'
 #' @keywords internal
 #' @noRd
-.AteraReadCountsMatrix <- function(data.dir, feature.types = NULL, bpcells.dir = NULL) {
+.AteraReadCountsMatrix <- function(data.dir, feature.types = NULL, bpcells.dir = NULL, nnz.batch = 5e7) {
   zip.file <- file.path(data.dir, "csc_cell_feature_matrix.zarr.zip")
   zidx <- .AteraZipIndex(zip.file)
   con <- file(zip.file, "rb")
@@ -3933,55 +4074,18 @@ ReadXenium <- function(
 
   x.indptr <- .AteraReadArray(con, zidx, "X/indptr")
 
-  requested.runs <- which(rl$values %in% need.build)
-  block.id <- cumsum(c(TRUE, diff(requested.runs) != 1L))
-  blocks <- split(requested.runs, block.id)
-
-  data.parts <- indices.parts <- p.parts <- list()
-  running <- 0L
-  row.idx <- integer(0)
-  for (blk in blocks) {
-    r1 <- starts[blk[1L]]
-    r2 <- ends[blk[length(blk)]]
-    nnz.start <- x.indptr[r1] + 1L
-    nnz.end <- x.indptr[r2 + 1L]
-    if (nnz.end >= nnz.start) {
-      d <- .AteraReadArray(con, zidx, "X/data", row.range = c(nnz.start, nnz.end))
-      i <- .AteraReadArray(con, zidx, "X/indices", row.range = c(nnz.start, nnz.end))
-    } else {
-      d <- numeric(0)
-      i <- numeric(0)
-    }
-    data.parts[[length(data.parts) + 1L]] <- d
-    indices.parts[[length(indices.parts) + 1L]] <- i
-    lp <- x.indptr[r1:(r2 + 1L)] - x.indptr[r1]
-    p.parts[[length(p.parts) + 1L]] <- if (length(p.parts) == 0L) lp else (lp + running)[-1L]
-    running <- running + length(d)
-    row.idx <- c(row.idx, r1:r2)
+  if (!is.null(bpcells.dir)) {
+    dir.create(bpcells.dir, showWarnings = FALSE, recursive = TRUE)
   }
-
-  var.sub <- var[row.idx, , drop = FALSE]
-  mtx <- new(
-    Class = "dgRMatrix",
-    j = as.integer(unlist(indices.parts)),
-    p = as.integer(unlist(p.parts)),
-    x = as.double(unlist(data.parts)),
-    Dim = c(nrow(var.sub), length(cell.ids))
-  )
-  mtx <- as(mtx, "CsparseMatrix")
-  rownames(mtx) <- var.sub$feature_name
-  colnames(mtx) <- cell.ids
-
   for (ft in need.build) {
-    sub <- mtx[var.sub$feature_type == ft, , drop = FALSE]
-    if (!is.null(bpcells.dir)) {
-      .AteraCheckBPCellsDeps()
-      cache.path <- file.path(bpcells.dir, .AteraSanitizeName(ft))
-      dir.create(bpcells.dir, showWarnings = FALSE, recursive = TRUE)
-      BPCells::write_matrix_dir(mat = sub, dir = cache.path)
-      sub <- BPCells::open_matrix_dir(dir = cache.path)
-    }
-    result[[ft]] <- sub
+    ft.i <- match(ft, rl$values)
+    cache.path <- if (!is.null(bpcells.dir)) file.path(bpcells.dir, .AteraSanitizeName(ft)) else NULL
+    result[[ft]] <- .AteraBuildFeatureTypeMatrix(
+      con = con, zidx = zidx, x.indptr = x.indptr,
+      r1 = starts[ft.i], r2 = ends[ft.i],
+      var = var, cell.ids = cell.ids,
+      bpcells.dir = bpcells.dir, cache.path = cache.path, nnz.budget = nnz.batch
+    )
   }
   return(result)
 }
