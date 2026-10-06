@@ -232,29 +232,25 @@ AddModuleScore.StdAssay <- function(
     ...
 ) {
   layer_names <- Layers(object, search = slot)
-  input_list <- lapply(
+  output_list <- lapply(
     layer_names,
     function(layer_name) {
+      # Operate on the layer's matrix directly. For on-disk (e.g. BPCells)
+      # matrices this keeps the data lazy: the scoring only needs row/column
+      # reductions, so wrapping in CreateAssayObject() (which densifies the
+      # whole matrix to a dgCMatrix) is unnecessary.
       layer_data <- LayerData(object, layer = layer_name)
-      layer_object <- CreateAssayObject(layer_data)
-      return (layer_object)
-    }
-  )
-  output_list <- lapply(
-    input_list,
-    function(input) {
-      AddModuleScore(object = input,
-                     features = features,
-                     kmeans.obj = kmeans.obj,
-                     pool = pool,
-                     nbin = nbin,
-                     ctrl = ctrl,
-                     k = k,
-                     name = name,
-                     seed = seed,
-                     search = search,
-                     slot = slot,
-                     ...)
+      .AddModuleScore(data = layer_data,
+                      features = features,
+                      kmeans.obj = kmeans.obj,
+                      pool = pool,
+                      nbin = nbin,
+                      ctrl = ctrl,
+                      k = k,
+                      name = name,
+                      seed = seed,
+                      search = search,
+                      ...)
     }
   )
   features.scores.use <- do.call(rbind,output_list)
@@ -268,8 +264,6 @@ AddModuleScore.StdAssay <- function(
 #' @concept utilities
 #' @rdname AddModuleScore
 #' @method AddModuleScore Assay
-#'
-#' @importFrom ggplot2 cut_number
 #'
 AddModuleScore.Assay <- function(
     object,
@@ -286,6 +280,46 @@ AddModuleScore.Assay <- function(
     ...
 ) {
   assay.data <- GetAssayData(object = object, layer = slot)
+  return(.AddModuleScore(data = assay.data,
+                        features = features,
+                        kmeans.obj = kmeans.obj,
+                        pool = pool,
+                        nbin = nbin,
+                        ctrl = ctrl,
+                        k = k,
+                        name = name,
+                        seed = seed,
+                        search = search,
+                        ...))
+}
+
+# Core AddModuleScore computation, operating directly on an expression matrix.
+#
+# Accepts any matrix supporting row/column reductions and row subsetting
+# (dgCMatrix, matrix, or an on-disk BPCells IterableMatrix), so callers can
+# avoid densifying on-disk data. Returns a data.frame of module scores (cells
+# as rows).
+#
+#' @importFrom ggplot2 cut_number
+#'
+#' @keywords internal
+#'
+#' @noRd
+#'
+.AddModuleScore <- function(
+    data,
+    features,
+    kmeans.obj,
+    pool = NULL,
+    nbin = 24,
+    ctrl = 100,
+    k = FALSE,
+    name = 'Cluster',
+    seed = 1,
+    search = FALSE,
+    ...
+) {
+  assay.data <- data
   features.old <- features
   if (k) {
     .NotYetUsed(arg = 'k')
@@ -301,7 +335,7 @@ AddModuleScore.Assay <- function(
     features <- lapply(
       X = features,
       FUN = function(x) {
-        missing.features <- setdiff(x = x, y = rownames(x = object))
+        missing.features <- setdiff(x = x, y = rownames(x = data))
         if (length(x = missing.features) > 0) {
           warning(
             "The following features are not present in the object: ",
@@ -332,7 +366,7 @@ AddModuleScore.Assay <- function(
                 )
               }
             )
-            missing.features <- setdiff(x = x, y = rownames(x = object))
+            missing.features <- setdiff(x = x, y = rownames(x = data))
             if (length(x = missing.features) > 0) {
               warning(
                 "The following features are still not present in the object: ",
@@ -343,7 +377,7 @@ AddModuleScore.Assay <- function(
             }
           }
         }
-        return(intersect(x = x, y = rownames(x = object)))
+        return(intersect(x = x, y = rownames(x = data)))
       }
     )
     cluster.length <- length(x = features)
@@ -357,7 +391,7 @@ AddModuleScore.Assay <- function(
     features <- lapply(
       X = features.old,
       FUN = CaseMatch,
-      match = rownames(x = object)
+      match = rownames(x = data)
     )
   }
   if (!all(LengthCheck(values = features))) {
@@ -367,7 +401,7 @@ AddModuleScore.Assay <- function(
       'exiting...'
     ))
   }
-  pool <- pool %||% rownames(x = object)
+  pool <- pool %||% rownames(x = data)
   data.avg <- Matrix::rowMeans(x = assay.data[pool, ])
   data.avg <- data.avg[order(data.avg)]
   data.cut <- cut_number(x = data.avg + rnorm(n = length(data.avg))/1e30, n = nbin, labels = FALSE, right = FALSE)
@@ -391,7 +425,7 @@ AddModuleScore.Assay <- function(
   ctrl.scores <- matrix(
     data = numeric(length = 1L),
     nrow = length(x = ctrl.use),
-    ncol = ncol(x = object)
+    ncol = ncol(x = data)
   )
   for (i in 1:length(ctrl.use)) {
     features.use <- ctrl.use[[i]]
@@ -400,7 +434,7 @@ AddModuleScore.Assay <- function(
   features.scores <- matrix(
     data = numeric(length = 1L),
     nrow = cluster.length,
-    ncol = ncol(x = object)
+    ncol = ncol(x = data)
   )
   for (i in 1:cluster.length) {
     features.use <- features[[i]]
@@ -410,7 +444,7 @@ AddModuleScore.Assay <- function(
   features.scores.use <- features.scores - ctrl.scores
   rownames(x = features.scores.use) <- paste0(name, 1:cluster.length)
   features.scores.use <- as.data.frame(x = t(x = features.scores.use))
-  rownames(x = features.scores.use) <- colnames(x = object)
+  rownames(x = features.scores.use) <- colnames(x = data)
   return(features.scores.use)
 }
 
@@ -1286,13 +1320,13 @@ PercentageFeatureSet <- function(
   layers <- Layers(object = object, assay = assay, search = "counts")
   for (i in seq_along(along.with = layers)) {
     layer <- layers[i]
-    features.layer <- features %||% grep(
-      pattern = pattern,
-      x = rownames(x = object[[assay]][layer]),
-      value = TRUE)
     layer.data <- LayerData(object = object,
                             assay = assay,
                             layer = layer)
+    features.layer <- features %||% grep(
+      pattern = pattern,
+      x = rownames(x = layer.data),
+      value = TRUE)
     features.layer <- intersect(features.layer, rownames(layer.data))
     layer.sums <- colSums(x = layer.data[features.layer, , drop = FALSE])
     layer.perc <- layer.sums / object[[]][colnames(layer.data), paste0("nCount_", assay)] * 100
@@ -3201,27 +3235,55 @@ BuildNicheAssay <- function(
 
 #' Set the number of threads to use for parallel processing in Seurat
 #'
-#' @param n Number of threads (>= 1) to use for processing. If NULL, will be set to (number of cores - 1).
+#' @param n Number of threads (>= 1) to use for processing. If NULL, will be set to (available cores / 2).
+#' @param verbose Whether to print the number of threads set and available cores to the console
+#'
+#' @details The default is one thread. Calling \code{setThreads()} without
+#' specifying \code{n} selects half the available cores. This setting 
+#' applies to supported C++ kernels in \code{NormalizeData},
+#' \code{FindVariableFeatures}, \code{ScaleData}, \code{SCTransform},
+#' \code{RunPCA}, \code{FindNeighbors}, \code{FindClusters}, and 
+#' CCA/RPCA integration. \code{RunUMAP} also passes this setting to the 
+#' \pkg{uwot} backend. Support depends on the input type, backend, and arguments; 
+#' not every stage of these functions can be run in parallel.
+#'
+#' Note that this thread setting is separate from \code{\link[future]{plan}}.
+#'
+#' @seealso \code{\link{getThreads}}
+#' 
 #' @concept utilities
+#' 
+#' @importFrom future availableCores
 #' @export
-setThreads <- function(n = NULL) {
-  ncores <- parallel::detectCores()
+setThreads <- function(n = NULL, verbose = TRUE) {
+  ncores <- future::availableCores()
   if (is.null(n)) {
     if (is.na(x = ncores)) {
       warning("Could not detect number of cores, defaulting to 1 thread")
       ncores <- 1L
     }
-    n <- max(1L, ncores - 1)
+    n <- max(1L, as.integer(ncores / 2))
   } else {
     stopifnot("Number of threads must be a positive integer" = (length(n) == 1 && is.numeric(n) && n >= 1))
   }
   options(Seurat.nthreads = n)
+  if (verbose) {
+    message("Seurat threads set to ", n, " (", ncores, " available cores detected)")
+  }
 }
 
 #' Get the number of threads being used for parallel processing in Seurat
 #'
+#' @param verbose Whether to print the number of threads set and available cores to the console
+#' @return The number of threads currently set for processing
+#' 
 #' @concept utilities
 #' @export
-getThreads <- function() {
-  return(getOption("Seurat.nthreads"))
+getThreads <- function(verbose = TRUE) {
+  n <- getOption("Seurat.nthreads")
+  if (verbose) {
+    message("Seurat threads: ", n)
+    message("Number of available cores detected: ", future::availableCores(), "\n")
+  }
+  return(n)
 }
