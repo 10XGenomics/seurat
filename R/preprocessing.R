@@ -3515,13 +3515,21 @@ ReadXenium <- function(
 #' (gene-sorted, contiguous) chunks needed for the requested genes out of
 #' each grid tile
 #'
+#' A gene's rows are typically spread across most of a bundle's grid tiles
+#' (eg ~85-88 of 102 for genes checked on a real whole-transcriptome bundle);
+#' each tile's read is independent, so this is parallelized across tiles
+#' rather than reading them one at a time. Each forked worker opens its own
+#' connection, since a connection's file position can't safely be shared/
+#' seeked concurrently across forked processes.
+#'
 #' @keywords internal
 #' @noRd
 .AteraFetchMolecules <- function(handle, genes = NULL) {
-  con <- file(handle$zip.file, "rb")
-  on.exit(close(con))
+  nthreads <- .AteraThreads()
 
-  tile.dfs <- lapply(handle$tiles, function(tile) {
+  read.tile <- function(tile) {
+    con <- file(handle$zip.file, "rb")
+    on.exit(close(con))
     gene_offset <- tile$gene_offset
     if (is.null(genes)) {
       location <- .AteraReadArray(con, handle$zidx, paste0(tile$dir, "/location"))
@@ -3546,7 +3554,13 @@ ReadXenium <- function(
       data.frame(x = loc[, 1], y = loc[, 2], gene = handle$gene.names[g], qv = as.vector(qv))
     })
     data.table::rbindlist(gene.dfs)
-  })
+  }
+
+  tile.dfs <- if (nthreads > 1L) {
+    parallel::mclapply(handle$tiles, read.tile, mc.cores = nthreads)
+  } else {
+    lapply(handle$tiles, read.tile)
+  }
 
   df <- as.data.frame(data.table::rbindlist(tile.dfs))
   if (!is.null(handle$mols.qv.threshold)) {

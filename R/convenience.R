@@ -574,6 +574,102 @@ LoadAteraSegmentations <- function(object, data.dir, fov, segmentations = "cell"
   return(object)
 }
 
+#' Load per-codeword transcript breakdowns for specific genes
+#'
+#' Atera's per-transcript \code{codeword_identity} (which specific barcode/
+#' codeword called each detection) is collapsed away by
+#' \code{\link{LoadAteraMolecules}}, which reports one combined position per
+#' gene. A gene can map to more than one distinct codeword (more than one
+#' probe/barcode design targeting the same gene); this instead returns one
+#' \code{"<gene>_codeword_<id>"} pseudo-feature per codeword, which is useful
+#' for a common QC question: whether different codewords for the same gene
+#' cluster differently in space (which would suggest a probe-specific
+#' artifact rather than true expression).
+#'
+#' @param object A Seurat object created by \code{\link{LoadAtera}}
+#' @param data.dir The same \code{data.dir} passed to the original
+#' \code{\link{LoadAtera}} call (the Atera output bundle directory)
+#' @param genes Character vector of one or more gene names to break down by
+#' codeword
+#' @param fov Name of the FOV to attach the resulting molecules to; defaults
+#' to the object's default FOV
+#'
+#' @return \code{object}, with one \code{"<gene>_codeword_<id>"} molecule
+#' entry per codeword mapping to each requested gene, merged into
+#' \code{object[[fov]]}'s existing molecule layer (regular genes loaded via
+#' \code{\link{LoadAteraMolecules}} are preserved, not overwritten; genes
+#' already broken down by a previous call are not re-fetched)
+#'
+#' @importFrom SeuratObject DefaultFOV Misc CreateMolecules
+#'
+#' @export
+#'
+LoadAteraCodewords <- function(object, data.dir, genes, fov = NULL) {
+  fov <- fov %||% DefaultFOV(object = object)
+
+  handle <- .AteraMoleculesHandle(data.dir = data.dir)
+  unknown <- setdiff(genes, handle$gene.names)
+  if (length(unknown) > 0) {
+    stop("Unknown Atera gene(s): ", paste(unknown, collapse = ", "), call. = FALSE)
+  }
+
+  handle.info <- Misc(object, slot = 'atera.molecules')
+  existing.cache <- if (is.null(handle.info)) NULL else handle.info$cache
+  cached.genes <- if (is.null(existing.cache)) character(0) else unique(existing.cache$gene)
+  already.loaded <- vapply(genes, function(g) {
+    any(grepl(paste0("^", g, "_codeword_"), cached.genes))
+  }, logical(1L))
+  missing.genes <- genes[!already.loaded]
+
+  if (length(missing.genes) > 0) {
+    zip.file <- file.path(data.dir, "transcripts.zarr.zip")
+    zidx <- .AteraZipIndex(zip.file)
+    nthreads <- .AteraThreads()
+
+    gene.dfs <- lapply(missing.genes, function(gene_name) {
+      gene.idx <- match(gene_name, handle$gene.names)
+      # A gene's rows are typically spread across most of the grid tiles (eg
+      # ~85-88 of 102 for genes checked on a real whole-transcriptome bundle);
+      # each tile's read is independent, so this is parallelized across
+      # tiles rather than reading them one at a time. Unlike .AteraReadArray's
+      # chunk-level parallelism (which shares one connection, reading
+      # sequentially before decoding in parallel), tile reads here are full,
+      # separate .AteraReadArray calls -- each forked worker opens its own
+      # connection, since a connection's file position can't safely be
+      # shared/seeked concurrently across forked processes.
+      read.tile <- function(tile) {
+        go <- tile$gene_offset
+        n <- go[gene.idx, 2] - go[gene.idx, 1]
+        if (n == 0) {
+          return(NULL)
+        }
+        rows <- c(go[gene.idx, 1] + 1L, go[gene.idx, 2])
+        con <- file(zip.file, "rb")
+        on.exit(close(con))
+        loc <- .AteraReadArray(con, zidx, paste0(tile$dir, "/location"), row.range = rows)
+        cw <- .AteraReadArray(con, zidx, paste0(tile$dir, "/codeword_identity"), row.range = rows)
+        data.frame(x = loc[, 1], y = loc[, 2], gene = paste0(gene_name, "_codeword_", cw))
+      }
+      tile.dfs <- if (nthreads > 1L) {
+        parallel::mclapply(handle$tiles, read.tile, mc.cores = nthreads)
+      } else {
+        lapply(handle$tiles, read.tile)
+      }
+      do.call(rbind, tile.dfs)
+    })
+    new.df <- do.call(rbind, gene.dfs)
+    existing.cache <- if (is.null(existing.cache)) new.df else rbind(existing.cache, new.df)
+  }
+
+  object[[fov]]@molecules <- list(molecules = CreateMolecules(existing.cache, key = 'mols_'))
+  if (!is.null(handle.info)) {
+    handle.info$cache <- existing.cache
+    Misc(object, 'atera.molecules') <- handle.info
+  }
+
+  return(object)
+}
+
 #' @param ... Extra parameters passed to \code{DimHeatmap}
 #'
 #' @rdname DimHeatmap
